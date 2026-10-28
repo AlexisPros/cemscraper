@@ -103,7 +103,14 @@ def test_record_shape_has_three_independent_objects() -> None:
     )
     record = question.to_record()
     assert list(record) == [
-        "exam", "specialization", "year", "season", "session_id", "question_number",
-        "question_data", "correct_answer", "answer_statistics",
+        "exam",
+        "specialization",
+        "year",
+        "season",
+        "session_id",
+        "question_number",
+        "question_data",
+        "correct_answer",
+        "answer_statistics",
     ]
     assert record["question_data"] == {"text": "P?", "options": OPTIONS}

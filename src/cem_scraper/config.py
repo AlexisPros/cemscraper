@@ -44,9 +44,7 @@ class CaptchaProviderName(StrEnum):
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(
-        env_prefix="CEM_", env_file=".env", env_file_encoding="utf-8", extra="ignore"
-    )
+    model_config = SettingsConfigDict(env_prefix="CEM_", env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
     database_url: SecretStr = SecretStr("postgresql://cem:cem_local_dev@localhost:5432/cem")
 

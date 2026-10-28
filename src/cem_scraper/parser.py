@@ -145,6 +145,14 @@ def make_soup(html: str) -> BeautifulSoup:
     return BeautifulSoup(html, "lxml")
 
 
+def attr(tag: Tag, name: str) -> str:
+    """A tag attribute as a string (BeautifulSoup returns lists for multi-valued attributes)."""
+    value = tag.get(name)
+    if value is None:
+        return ""
+    return value if isinstance(value, str) else " ".join(value)
+
+
 def normalize_header(text: str) -> str:
     decomposed = unicodedata.normalize("NFKD", text.replace("ł", "l").replace("Ł", "L"))
     ascii_only = "".join(ch for ch in decomposed if not unicodedata.combining(ch))
@@ -159,16 +167,21 @@ def _clean_lines(raw: str) -> str:
     return re.sub(r"\n{3,}", "\n\n", text)
 
 
-def element_text(element: Tag, attachments: list[Attachment] | None = None, location: str = "") -> str:
+def element_text(
+    element: Tag, attachments: list[Attachment] | None = None, location: str = "", skip: Tag | None = None
+) -> str:
     """Text of an element with ``<br>`` -> newline and whitespace normalised.
 
     Images and tables are recorded as attachments instead of being silently dropped;
     table cell text is kept inline (one row per line, cells separated by `` | ``).
+    ``skip`` excludes one descendant (the option label) without copying the tree.
     """
     parts: list[str] = []
 
     def walk(node: Tag) -> None:
         for child in node.children:
+            if child is skip:
+                continue
             if isinstance(child, NavigableString):
                 if child.__class__.__name__ in ("Comment", "Script", "Stylesheet"):
                     continue
@@ -182,7 +195,12 @@ def element_text(element: Tag, attachments: list[Attachment] | None = None, loca
                 elif name == "img":
                     if attachments is not None:
                         attachments.append(
-                            Attachment(kind="image", src=child.get("src"), alt=child.get("alt"), location=location)
+                            Attachment(
+                                kind="image",
+                                src=attr(child, "src") or None,
+                                alt=attr(child, "alt") or None,
+                                location=location,
+                            )
                         )
                 elif name == "table":
                     if attachments is not None:
@@ -205,8 +223,7 @@ def _in_hidden_container(tag: Tag, root: Tag) -> bool:
     for parent in tag.parents:
         if parent is root or parent is None:
             return False
-        element_id = parent.get("id") or ""
-        if HIDDEN_CONTAINER_ID_RE.match(element_id):
+        if HIDDEN_CONTAINER_ID_RE.match(attr(parent, "id")):
             return True
     return False
 
@@ -221,12 +238,8 @@ def _option_label(paragraph: Tag) -> str | None:
 
 
 def _option_text(paragraph: Tag, attachments: list[Attachment], label: str) -> str:
-    clone = BeautifulSoup(str(paragraph), "lxml").find("p")
-    assert clone is not None
-    bold = clone.find(["b", "strong"], recursive=False)
-    if bold is not None:
-        bold.decompose()
-    return element_text(clone, attachments, location=f"option {label}")
+    bold = paragraph.find(["b", "strong"], recursive=False)
+    return element_text(paragraph, attachments, location=f"option {label}", skip=bold)
 
 
 def _parse_decimal(raw: str) -> Decimal:
@@ -278,11 +291,7 @@ def _find_question_number(root: Tag, option_a: Tag) -> tuple[int | None, int | N
             match = pattern.search(text)
             if match:
                 number = int(match.group(1))
-                total = (
-                    int(total_match.group(2))
-                    if total_match and int(total_match.group(1)) == number
-                    else None
-                )
+                total = int(total_match.group(2)) if total_match and int(total_match.group(1)) == number else None
                 return number, total
     return None, None
 
@@ -371,18 +380,14 @@ def _statistics_pairs(rows: list[list[str]]) -> list[tuple[str, str]]:
         if sum(is_known(cell) for cell in row) >= 2:
             values = rows[index + 1]
             if len(values) < len(row):
-                raise MalformedQuestion(
-                    f"statistics value row has {len(values)} cells for {len(row)} headers"
-                )
+                raise MalformedQuestion(f"statistics value row has {len(values)} cells for {len(row)} headers")
             return list(zip(row, values, strict=False))
     if rows and all(len(row) >= 2 for row in rows) and sum(is_known(row[0]) for row in rows) >= 2:
         return [(row[0], row[1]) for row in rows]
     raise MalformedQuestion("statistics table headers not recognised")
 
 
-def _parse_statistics(
-    soup: BeautifulSoup, issues: list[str]
-) -> tuple[AnswerStatistics | None, dict[str, str] | None]:
+def _parse_statistics(soup: BeautifulSoup, issues: list[str]) -> tuple[AnswerStatistics | None, dict[str, str] | None]:
     table = soup.select_one("#statystyki1 table") or soup.select_one("[id^=statystyki] table")
     if table is None:
         return None, None
@@ -442,9 +447,7 @@ def parse_question_page(html: str, expected_number: int | None = None) -> Parsed
     text = "\n".join(element_text(p, attachments, location="question") for p in question_paragraphs)
     text = ANSWER_PHRASE_RE.sub("", text).strip()
 
-    options = {
-        label: _option_text(paragraph, attachments, label) for label, paragraph in _option_paragraphs(option_a)
-    }
+    options = {label: _option_text(paragraph, attachments, label) for label, paragraph in _option_paragraphs(option_a)}
 
     try:
         question_data = QuestionData(text=text, options=options, attachments=attachments or None)
@@ -483,32 +486,32 @@ def parse_entry_form(html: str) -> EntryForm:
     scope: Tag = form or soup
     fields: dict[str, str] = {}
     for element in scope.find_all(["input", "select", "textarea"]):
-        name = element.get("name")
+        name = attr(element, "name")
         if not name or name == "g-recaptcha-response":
             continue
         if element.name == "select":
             selected = element.find("option", selected=True) or element.find("option")
-            fields[name] = selected.get("value", "") if selected else ""
-        elif element.get("type", "").lower() in ("submit", "button", "image"):
+            fields[name] = attr(selected, "value") if selected else ""
+        elif attr(element, "type").lower() in ("submit", "button", "image"):
             continue
         else:
-            fields[name] = element.get("value", "")
+            fields[name] = attr(element, "value")
 
     def options_of(name: str) -> dict[str, str]:
         select = scope.find("select", attrs={"name": name})
         if select is None:
             return {}
         return {
-            opt.get("value", "").strip(): " ".join(opt.get_text(" ", strip=True).split())
+            attr(opt, "value").strip(): " ".join(opt.get_text(" ", strip=True).split())
             for opt in select.find_all("option")
-            if opt.get("value", "").strip()
+            if attr(opt, "value").strip()
         }
 
     sitekey_el = soup.select_one("[data-sitekey]")
     return EntryForm(
-        action=form.get("action") if form else None,
+        action=attr(form, "action") or None if form else None,
         fields=fields,
-        recaptcha_sitekey=sitekey_el.get("data-sitekey") if sitekey_el else None,
+        recaptcha_sitekey=attr(sitekey_el, "data-sitekey") or None if sitekey_el else None,
         session_options=options_of("sesja"),
         specialization_options=options_of("specjalizacja"),
     )

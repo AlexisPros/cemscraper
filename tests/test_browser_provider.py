@@ -25,9 +25,7 @@ from tests.conftest import EDGE, load, question_page
 playwright = pytest.importorskip("playwright.async_api")
 
 # The synthetic form without Google's script: nothing external is loaded.
-FORM = load(EDGE / "entry_form.html").replace(
-    '<script src="https://www.google.com/recaptcha/api.js"></script>', ""
-)
+FORM = load(EDGE / "entry_form.html").replace('<script src="https://www.google.com/recaptcha/api.js"></script>', "")
 
 
 class StandIn(BaseHTTPRequestHandler):
@@ -86,7 +84,12 @@ async def test_interactive_flow_hands_session_to_httpx(
     settings: Settings, standin_url: str, context_requests: bool
 ) -> None:
     s = settings.model_copy(
-        update={"base_url": standin_url, "browser_headless": True, "browser_wait_timeout": 20, "requests_per_second": 1000}
+        update={
+            "base_url": standin_url,
+            "browser_headless": True,
+            "browser_wait_timeout": 20,
+            "requests_per_second": 1000,
+        }
     )
     provider = InteractiveBrowserAccessProvider(s, use_context_requests=context_requests)
     manager = SessionManager(s, provider, Metrics())

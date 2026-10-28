@@ -18,10 +18,7 @@ _SECRET_PATTERNS = [
 
 def redact(text: str) -> str:
     for pattern in _SECRET_PATTERNS:
-        if pattern.groups == 2:
-            text = pattern.sub(r"\1***\2", text)
-        else:
-            text = pattern.sub(r"\1***", text)
+        text = pattern.sub(r"\1***\2" if pattern.groups == 2 else r"\1***", text)
     return text
 
 
@@ -54,9 +51,7 @@ def configure_logging(level: str = "INFO", as_json: bool = False) -> None:
     if as_json:
         handler.setFormatter(JsonFormatter())
     else:
-        handler.setFormatter(
-            logging.Formatter("%(asctime)s %(levelname)-7s %(name)s: %(message)s", "%H:%M:%S")
-        )
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)-7s %(name)s: %(message)s", "%H:%M:%S"))
     root = logging.getLogger()
     root.handlers[:] = [handler]
     root.setLevel(level)

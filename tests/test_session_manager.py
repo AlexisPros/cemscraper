@@ -98,7 +98,9 @@ async def test_http_form_flow_with_authorized_provider(settings: Settings) -> No
 @respx.mock
 async def test_http_form_rejects_session_not_offered(settings: Settings) -> None:
     respx.get(BASE + "eula_pes.php").mock(return_value=httpx.Response(200))
-    respx.post(BASE + "form_pytania_pes.php").mock(return_value=httpx.Response(200, html=load(EDGE / "entry_form.html")))
+    respx.post(BASE + "form_pytania_pes.php").mock(
+        return_value=httpx.Response(200, html=load(EDGE / "entry_form.html"))
+    )
     provider = HttpFormAccessProvider(http_settings(settings), FakeAuthorizedCaptcha())
     async with CemClient(settings, Metrics()) as client:
         with pytest.raises(AccessBlocked, match="not offered by the official form"):
@@ -108,8 +110,12 @@ async def test_http_form_rejects_session_not_offered(settings: Settings) -> None
 @respx.mock
 async def test_http_form_detects_rejected_submission(settings: Settings) -> None:
     respx.get(BASE + "eula_pes.php").mock(return_value=httpx.Response(200))
-    respx.post(BASE + "form_pytania_pes.php").mock(return_value=httpx.Response(200, html=load(EDGE / "entry_form.html")))
-    respx.post(BASE + "wyswietl_pytania_pes.php").mock(return_value=httpx.Response(200, html=load(EDGE / "entry_form.html")))
+    respx.post(BASE + "form_pytania_pes.php").mock(
+        return_value=httpx.Response(200, html=load(EDGE / "entry_form.html"))
+    )
+    respx.post(BASE + "wyswietl_pytania_pes.php").mock(
+        return_value=httpx.Response(200, html=load(EDGE / "entry_form.html"))
+    )
     provider = HttpFormAccessProvider(http_settings(settings), FakeAuthorizedCaptcha())
     async with CemClient(settings, Metrics()) as client:
         with pytest.raises(AccessBlocked, match="was not accepted"):

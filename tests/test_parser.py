@@ -76,8 +76,12 @@ def test_reference_b_autumn_2026(html_2026: str) -> None:
     assert question.correct_answer is not None and question.correct_answer.option == "E"
     stats = question.answer_statistics
     assert stats is not None
-    assert (stats.A, stats.B, stats.C, stats.D, stats.E) == tuple(
-        Decimal(v) for v in ("40.2", "29.3", "3.0", "3.0", "24.4")
+    assert tuple(Decimal(v) for v in ("40.2", "29.3", "3.0", "3.0", "24.4")) == (
+        stats.A,
+        stats.B,
+        stats.C,
+        stats.D,
+        stats.E,
     )
     assert stats.difficulty_index == Decimal("0.295")
     assert question.validation_status is ValidationStatus.VALID
@@ -106,13 +110,17 @@ def test_header_paragraph_not_part_of_question(html_2003: str) -> None:
 
 
 def test_whitespace_normalised_and_br_preserved() -> None:
-    html = question_page(question="  Pierwsza   linia\n\t ciągle ta sama<br>  druga&nbsp;linia  <br><br><br><br>trzecia")
+    html = question_page(
+        question="  Pierwsza   linia\n\t ciągle ta sama<br>  druga&nbsp;linia  <br><br><br><br>trzecia"
+    )
     assert parse_question_page(html).question_data.text == "Pierwsza linia ciągle ta sama\ndruga linia\n\ntrzecia"
 
 
 def test_html_entities_and_polish_unicode_preserved() -> None:
-    html = question_page(question="Stężenie &lt;5 mmol/l &amp; ŻÓŁĆ – „cytat” ≥ 2‰?", options={
-        "A": "ąćęłńóśźż", "B": "ĄĆĘŁŃÓŚŹŻ", "C": "10&nbsp;mg", "D": "x &gt; y", "E": "μg/kg"})
+    html = question_page(
+        question="Stężenie &lt;5 mmol/l &amp; ŻÓŁĆ – „cytat” ≥ 2‰?",
+        options={"A": "ąćęłńóśźż", "B": "ĄĆĘŁŃÓŚŹŻ", "C": "10&nbsp;mg", "D": "x &gt; y", "E": "μg/kg"},
+    )
     parsed = parse_question_page(html)
     assert parsed.question_data.text == "Stężenie <5 mmol/l & ŻÓŁĆ – „cytat” ≥ 2‰?"
     assert parsed.question_data.options["A"] == "ąćęłńóśźż"
@@ -177,16 +185,31 @@ def test_unreadable_answer_recorded_as_issue() -> None:
 
 def test_statistics_with_comma_decimals_and_percent_sign() -> None:
     rows = [
-        ["Procent odp. A", "Procent odp. B", "Procent odp. C", "Procent odp. D", "Procent odp. E", "Wskaźnik trudności"],
+        [
+            "Procent odp. A",
+            "Procent odp. B",
+            "Procent odp. C",
+            "Procent odp. D",
+            "Procent odp. E",
+            "Wskaźnik trudności",
+        ],
         ["10,5%", "59,5%", "10", "10", "10", "0,595"],
     ]
     stats = parse_question_page(question_page(stats_rows=rows)).answer_statistics
-    assert stats is not None and stats.A == Decimal("10.5") and stats.difficulty_index == Decimal("0.595")
+    assert stats is not None and Decimal("10.5") == stats.A and stats.difficulty_index == Decimal("0.595")
 
 
 def test_statistics_headers_matched_by_name_not_position() -> None:
     rows = [
-        ["Wskaźnik trudności", "M.D.", "Procent odp. E", "Procent odp. D", "Procent odp. C", "Procent odp. B", "Procent odp. A"],
+        [
+            "Wskaźnik trudności",
+            "M.D.",
+            "Procent odp. E",
+            "Procent odp. D",
+            "Procent odp. C",
+            "Procent odp. B",
+            "Procent odp. A",
+        ],
         ["0.5", "0.1", "5", "5", "10", "30", "50"],
     ]
     stats = parse_question_page(question_page(stats_rows=rows)).answer_statistics
@@ -194,23 +217,70 @@ def test_statistics_headers_matched_by_name_not_position() -> None:
 
 
 def test_vertical_statistics_table() -> None:
-    rows = [["Procent odp. A", "20"], ["Procent odp. B", "20"], ["Procent odp. C", "20"],
-            ["Procent odp. D", "20"], ["Procent odp. E", "20"], ["Wskaźnik trudności", "0.2"]]
+    rows = [
+        ["Procent odp. A", "20"],
+        ["Procent odp. B", "20"],
+        ["Procent odp. C", "20"],
+        ["Procent odp. D", "20"],
+        ["Procent odp. E", "20"],
+        ["Wskaźnik trudności", "0.2"],
+    ]
     assert parse_question_page(question_page(stats_rows=rows)).answer_statistics is not None
 
 
 @pytest.mark.parametrize(
     ("rows", "message"),
     [
-        ([["Procent odp. A", "Procent odp. B", "Procent odp. C", "Procent odp. D", "Procent odp. E", "Wskaźnik trudności"],
-          ["abc", "1", "1", "1", "1", "0.1"]], "non-numeric"),
-        ([["Procent odp. A", "Procent odp. B", "Procent odp. C", "Procent odp. D", "Wskaźnik trudności"],
-          ["1", "1", "1", "1", "0.1"]], "lacks required columns"),
+        (
+            [
+                [
+                    "Procent odp. A",
+                    "Procent odp. B",
+                    "Procent odp. C",
+                    "Procent odp. D",
+                    "Procent odp. E",
+                    "Wskaźnik trudności",
+                ],
+                ["abc", "1", "1", "1", "1", "0.1"],
+            ],
+            "non-numeric",
+        ),
+        (
+            [
+                ["Procent odp. A", "Procent odp. B", "Procent odp. C", "Procent odp. D", "Wskaźnik trudności"],
+                ["1", "1", "1", "1", "0.1"],
+            ],
+            "lacks required columns",
+        ),
         ([["Kolumna 1", "Kolumna 2"], ["1", "2"]], "headers not recognised"),
-        ([["Procent odp. A", "Procent odp. B", "Procent odp. C", "Procent odp. D", "Procent odp. E", "Wskaźnik trudności"],
-          ["120", "1", "1", "1", "1", "0.1"]], "outside 0-100"),
-        ([["Procent odp. A", "Procent odp. B", "Procent odp. C", "Procent odp. D", "Procent odp. E", "Wskaźnik trudności"],
-          ["1", "1", "1"]], "value row has"),
+        (
+            [
+                [
+                    "Procent odp. A",
+                    "Procent odp. B",
+                    "Procent odp. C",
+                    "Procent odp. D",
+                    "Procent odp. E",
+                    "Wskaźnik trudności",
+                ],
+                ["120", "1", "1", "1", "1", "0.1"],
+            ],
+            "outside 0-100",
+        ),
+        (
+            [
+                [
+                    "Procent odp. A",
+                    "Procent odp. B",
+                    "Procent odp. C",
+                    "Procent odp. D",
+                    "Procent odp. E",
+                    "Wskaźnik trudności",
+                ],
+                ["1", "1", "1"],
+            ],
+            "value row has",
+        ),
     ],
 )
 def test_malformed_statistics(rows: list[list[str]], message: str) -> None:

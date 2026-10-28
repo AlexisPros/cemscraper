@@ -31,7 +31,11 @@ def make_question(number: int = 1, text: str = "Pytanie?", answer: str = "A") ->
         question_data=QuestionData(text=text, options={k: f"opcja {k}" for k in "ABCDE"}),
         correct_answer=CorrectAnswer(option=answer),  # type: ignore[arg-type]
         answer_statistics=AnswerStatistics(
-            A=Decimal("84.2"), B=Decimal("8.8"), C=Decimal("1.8"), D=Decimal("3.5"), E=Decimal("1.8"),
+            A=Decimal("84.2"),
+            B=Decimal("8.8"),
+            C=Decimal("1.8"),
+            D=Decimal("3.5"),
+            E=Decimal("1.8"),
             difficulty_index=Decimal("0.900"),
         ),
         extra_statistics={"M.D.": "0.12"},
@@ -106,7 +110,9 @@ async def test_runs_and_export_records(pg_repo: PostgresRepository) -> None:
     run = await pg_repo.start_run(["20031"], "test")
     await pg_repo.upsert_question(state.id, make_question(2, answer="B"), run)
     await pg_repo.upsert_question(state.id, make_question(1), run)
-    await pg_repo.finish_run(run, RunStatus.COMPLETED, {"questions_requested": 2, "questions_succeeded": 2, "retries": 1})
+    await pg_repo.finish_run(
+        run, RunStatus.COMPLETED, {"questions_requested": 2, "questions_succeeded": 2, "retries": 1}
+    )
     records = await pg_repo.fetch_records()
     assert [r["question_number"] for r in records] == [1, 2]
     assert records[0]["session_id"] == "20031" and records[0]["season"] == "spring"

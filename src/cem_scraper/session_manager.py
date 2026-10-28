@@ -183,7 +183,7 @@ class PlaywrightRequestTransport(httpx.AsyncBaseTransport):
     the human authorized. Used when ``CEM_BROWSER_CONTEXT_REQUESTS=true``.
     """
 
-    _DROP = {"host", "content-length", "cookie", "connection", "accept-encoding"}
+    _DROP = frozenset({"host", "content-length", "cookie", "connection", "accept-encoding"})
 
     def __init__(self, context: Any, timeout_ms: float) -> None:
         self._context = context
@@ -340,9 +340,7 @@ def build_access_provider(settings: Settings, captcha: CaptchaProvider) -> Acces
         case AccessProviderName.HTTP_FORM:
             return HttpFormAccessProvider(settings, captcha)
         case AccessProviderName.INTERACTIVE_BROWSER:
-            return InteractiveBrowserAccessProvider(
-                settings, use_context_requests=settings.browser_context_requests
-            )
+            return InteractiveBrowserAccessProvider(settings, use_context_requests=settings.browser_context_requests)
     raise AccessBlocked(f"unknown access provider {settings.access_provider!r}")
 
 

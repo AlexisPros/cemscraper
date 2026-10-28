@@ -58,7 +58,14 @@ def question_page(
     options = options if options is not None else {k: f"opcja {k.lower()}" for k in "ABCDE"}
     if stats_rows is None:
         stats_rows = [
-            ["Procent odp. A", "Procent odp. B", "Procent odp. C", "Procent odp. D", "Procent odp. E", "Wskaźnik trudności"],
+            [
+                "Procent odp. A",
+                "Procent odp. B",
+                "Procent odp. C",
+                "Procent odp. D",
+                "Procent odp. E",
+                "Wskaźnik trudności",
+            ],
             ["10.0", "60.0", "10.0", "10.0", "10.0", "0.600"],
         ]
     center_html = "" if center == "" else f"<center>{center or f'Pytanie nr {number}'}</center>"

@@ -55,6 +55,16 @@ class Metrics:
         elif outcome != "missing":
             self.questions_failed += 1
 
+    def reclassify_question(self, session_code: str, old: str, new: str) -> None:
+        """Move an already-counted question outcome (e.g. auth_error -> missing)."""
+        for counter in (self.outcomes, self.per_session[session_code]):
+            counter[old] -= 1
+            counter[new] += 1
+        if old != "missing":
+            self.questions_failed -= 1
+        if new not in ("missing", "stored"):
+            self.questions_failed += 1
+
     def stop(self) -> None:
         self.finished = time.monotonic()
 

@@ -115,7 +115,9 @@ def _print_report(report: RunReport) -> None:
     m = report.metrics
     print(f"\nrun {report.run_id}: {report.status.value}")
     for s in report.sessions:
-        line = f"  {s.session_code}: {s.outcome.value:<10} discovered={s.discovered_question_count:<4} stored={s.stored}"
+        line = (
+            f"  {s.session_code}: {s.outcome.value:<10} discovered={s.discovered_question_count:<4} stored={s.stored}"
+        )
         if s.missing:
             line += f" missing={s.missing}"
         if s.failed:
@@ -123,6 +125,7 @@ def _print_report(report: RunReport) -> None:
         if s.error:
             line += f"\n      reason: {s.error}"
         print(line)
+
     def secs(key: str) -> str:
         return "-" if m[key] is None else f"{m[key]}s"
 

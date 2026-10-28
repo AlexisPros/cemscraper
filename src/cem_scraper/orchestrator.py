@@ -40,6 +40,14 @@ from cem_scraper.session_manager import AccessBlocked, AuthorizedSession, Sessio
 
 log = logging.getLogger(__name__)
 
+# Outcomes proving that a question exists at that number (content was served).
+EXISTING_STATUSES = {
+    AttemptStatus.STORED,
+    AttemptStatus.PARSE_ERROR,
+    AttemptStatus.NUMBER_MISMATCH,
+    AttemptStatus.UNEXPECTED_CONTENT,
+}
+
 FAILURE_STATUSES = {
     AttemptStatus.PARSE_ERROR,
     AttemptStatus.NUMBER_MISMATCH,
@@ -91,17 +99,13 @@ class _StopRun(Exception):
 
 
 class Orchestrator:
-    def __init__(
-        self, settings: Settings, repository: Repository, sessions: SessionManager, metrics: Metrics
-    ) -> None:
+    def __init__(self, settings: Settings, repository: Repository, sessions: SessionManager, metrics: Metrics) -> None:
         self.settings = settings
         self.repo = repository
         self.sessions = sessions
         self.metrics = metrics
 
-    async def run(
-        self, session_codes: list[str], *, refetch: bool = False, only_failed: bool = False
-    ) -> RunReport:
+    async def run(self, session_codes: list[str], *, refetch: bool = False, only_failed: bool = False) -> RunReport:
         run_id = await self.repo.start_run(session_codes, self.sessions.provider.name)
         log.info("run %s started for %d session(s)", run_id, len(session_codes))
         reports: list[SessionReport] = []
@@ -185,7 +189,7 @@ class Orchestrator:
         try:
             if only_failed:
                 auth = await self._process_numbers(auth, state.id, run_id, todo, report, done)
-                highest = max(done | set(statuses), default=0)
+                highest = state.discovered_question_count or 0  # refined below from stored statuses
             else:
                 auth, highest = await self._discover(auth, state.id, run_id, report, done)
         except _StopRun as stop:
@@ -197,6 +201,8 @@ class Orchestrator:
             await self.sessions.release(auth)
 
         all_statuses = await self.repo.attempt_statuses(state.id)
+        if only_failed:
+            highest = max([highest, *(n for n, s in all_statuses.items() if s in EXISTING_STATUSES)], default=0)
         report.stored = sum(s is AttemptStatus.STORED for s in all_statuses.values())
         report.missing = sorted(n for n, s in all_statuses.items() if s is AttemptStatus.MISSING and n < highest)
         report.discovered_question_count = highest
@@ -216,9 +222,7 @@ class Orchestrator:
                 state.id, CollectionStatus.FAILED, discovered_question_count=highest, last_error=message
             )
         else:
-            await self.repo.set_session_status(
-                state.id, CollectionStatus.COMPLETED, discovered_question_count=highest
-            )
+            await self.repo.set_session_status(state.id, CollectionStatus.COMPLETED, discovered_question_count=highest)
         return report
 
     # ------------------------------------------------------------------ discovery
@@ -324,12 +328,14 @@ class Orchestrator:
         try:
             page = await auth.client.fetch_question(auth.session, number)
         except AccessDenied as exc:
-            return await self._record(session_id, run_id, code, QuestionResult(number, AttemptStatus.AUTH_ERROR, str(exc)))
+            result = QuestionResult(number, AttemptStatus.AUTH_ERROR, str(exc))
+            return await self._record(session_id, run_id, code, result)
         except (ServerUnavailable, ServerThrottled) as exc:
             await self.repo.record_attempt(session_id, number, AttemptStatus.SERVER_ERROR, str(exc), run_id)  # type: ignore[arg-type]
             raise _StopRun(SessionOutcome.ABORTED, str(exc)) from exc
         except (RequestFailed, UnexpectedStatus) as exc:
-            return await self._record(session_id, run_id, code, QuestionResult(number, AttemptStatus.SERVER_ERROR, str(exc)))
+            result = QuestionResult(number, AttemptStatus.SERVER_ERROR, str(exc))
+            return await self._record(session_id, run_id, code, result)
         return await self._handle_html(auth, session_id, run_id, number, page.html, page.url)
 
     async def _handle_html(
@@ -392,6 +398,9 @@ class Orchestrator:
             for r in auth_failures:
                 r.status, r.error = AttemptStatus.MISSING, "server returned the entry form; session still valid"
                 await self.repo.record_attempt(session_id, r.number, r.status, r.error, run_id)  # type: ignore[arg-type]
+                self.metrics.reclassify_question(
+                    auth.session.session_code, AttemptStatus.AUTH_ERROR.value, AttemptStatus.MISSING.value
+                )
             return auth
         try:
             return await self.sessions.reauthorize(auth)

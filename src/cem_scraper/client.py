@@ -28,7 +28,7 @@ from bs4 import BeautifulSoup
 from cem_scraper.config import EXAM_TYPE, QUESTION_PATH, Settings
 from cem_scraper.metrics import Metrics
 from cem_scraper.models import ExamSession
-from cem_scraper.parser import decode_html
+from cem_scraper.parser import attr, decode_html
 
 log = logging.getLogger(__name__)
 
@@ -88,6 +88,10 @@ class RateLimiter:
         self._lock = asyncio.Lock()
         self._next_slot = 0.0
 
+    def defer(self, seconds: float) -> None:
+        """Hold back *all* future request starts by ``seconds`` (the server asked us to wait)."""
+        self._next_slot = max(self._next_slot, self._clock() + seconds)
+
     async def acquire(self) -> None:
         async with self._lock:
             now = self._clock()
@@ -116,7 +120,7 @@ def sanitize_snapshot(html: str) -> str:
     """Blank values of hidden inputs that could carry tokens before saving HTML to disk."""
     soup = BeautifulSoup(html, "lxml")
     for element in soup.find_all(["input", "textarea"]):
-        name = (element.get("name") or element.get("id") or "").lower()
+        name = (attr(element, "name") or attr(element, "id")).lower()
         if any(hint in name for hint in SENSITIVE_INPUT_HINTS):
             if element.name == "textarea":
                 element.string = ""
@@ -209,10 +213,16 @@ class CemClient:
                     log.warning("%s %s -> HTTP %d (attempt %d)", method, path, status, attempt + 1)
             if attempt == self.settings.max_retries:
                 break
-            wait = delay if delay is not None else self._backoff(attempt)
             self.metrics.record_retry()
-            log.info("retrying %s %s in %.1fs", method, path, wait)
-            await self._sleep(wait)
+            if delay is not None:
+                # Retry-After applies to the whole client, not just this request:
+                # the limiter now holds back every request start, including this retry.
+                self._limiter.defer(delay)
+                log.info("server asked to wait %.1fs; pausing all requests", delay)
+            else:
+                wait = self._backoff(attempt)
+                log.info("retrying %s %s in %.1fs", method, path, wait)
+                await self._sleep(wait)
 
         self._consecutive_failures += 1
         if self._consecutive_failures >= self.settings.circuit_breaker_threshold:

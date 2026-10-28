@@ -42,17 +42,19 @@ def sleep() -> FakeSleep:
 
 
 @pytest.fixture
-def client_factory(settings: Settings, sleep: FakeSleep):
-    clients: list[CemClient] = []
+def limiter_sleep() -> FakeSleep:
+    return FakeSleep()
 
+
+@pytest.fixture
+def client_factory(settings: Settings, sleep: FakeSleep, limiter_sleep: FakeSleep):
     def make(**overrides: object) -> CemClient:
         s = settings.model_copy(update=overrides)
-        limiter = RateLimiter(1000, sleep=FakeSleep())  # keep backoff sleeps separate from spacing
-        client = CemClient(s, Metrics(), sleep=sleep, rate_limiter=limiter)
-        clients.append(client)
-        return client
+        # Backoff sleeps (``sleep``) are recorded separately from request spacing (``limiter_sleep``).
+        limiter = RateLimiter(1000, sleep=limiter_sleep)
+        return CemClient(s, Metrics(), sleep=sleep, rate_limiter=limiter)
 
-    yield make
+    return make
 
 
 @respx.mock
@@ -63,8 +65,12 @@ async def test_fetch_question_posts_observed_payload(client_factory) -> None:
     assert page.status_code == 200 and "ok" in page.html
     sent = {k: v[0] for k, v in parse_qs(route.calls[0].request.content.decode()).items()}
     assert sent == {
-        "autoryzacja": "1", "sesja": "20262", "typ": "PES", "specjalizacja": "725",
-        "nr_pytania": "2", "gdzieidziesz": "doprzodu",
+        "autoryzacja": "1",
+        "sesja": "20262",
+        "typ": "PES",
+        "specjalizacja": "725",
+        "nr_pytania": "2",
+        "gdzieidziesz": "doprzodu",
     }
     assert "g-recaptcha-response" not in sent
     assert client.metrics.request_successes == 1
@@ -83,12 +89,15 @@ async def test_retries_transient_errors_with_backoff(client_factory, sleep: Fake
 
 
 @respx.mock
-async def test_honours_retry_after(client_factory, sleep: FakeSleep) -> None:
+async def test_retry_after_pauses_every_request(client_factory, sleep: FakeSleep, limiter_sleep: FakeSleep) -> None:
     respx.post(QUESTION_URL).mock(
-        side_effect=[httpx.Response(429, headers={"Retry-After": "7"}), httpx.Response(200, html="ok")]
+        side_effect=[httpx.Response(429, headers={"Retry-After": "7"}), httpx.Response(200), httpx.Response(200)]
     )
-    await client_factory().post("wyswietl_pytania_pes.php", {})
-    assert sleep.calls == [7.0]
+    client = client_factory()
+    await client.post("wyswietl_pytania_pes.php", {})  # the throttled request, retried after the pause
+    await client.post("wyswietl_pytania_pes.php", {})  # an unrelated request must also respect the pause
+    assert sleep.calls == []  # no private backoff: the pause is global
+    assert [round(s) for s in limiter_sleep.calls] == [7, 7]
 
 
 @respx.mock

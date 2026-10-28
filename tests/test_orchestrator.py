@@ -103,7 +103,7 @@ async def test_discovery_with_gap_using_fixtures(fast: Settings) -> None:
 
 async def test_question_count_not_assumed(fast: Settings) -> None:
     provider = ScriptedProvider(default_responder(13))
-    orchestrator, repo = build(fast, provider)
+    orchestrator, _repo = build(fast, provider)
     report = await orchestrator.run(["20031"])
     assert report.sessions[0].discovered_question_count == 13
     assert max(provider.numbers()) <= 13 + 3 + fast.concurrency
@@ -172,6 +172,9 @@ async def test_retry_failed_only_reprocesses_failures(fast: Settings) -> None:
     report = await orchestrator2.run(["20031"], only_failed=True)
     assert provider.numbers() == [2]
     assert report.sessions[0].outcome is SessionOutcome.COMPLETED
+    # Probes past the end (5, 6, ...) were recorded as missing; they must not count as questions.
+    assert report.sessions[0].discovered_question_count == 4
+    assert report.sessions[0].missing == []
 
 
 async def test_completed_session_skipped_unless_refetch(fast: Settings) -> None:
@@ -210,11 +213,13 @@ async def test_entry_form_for_out_of_range_number_with_valid_session(fast: Setti
         return question_page(number=number) if number <= 3 else ENTRY_FORM
 
     provider = ScriptedProvider(respond)
-    orchestrator, repo = build(fast, provider)
+    orchestrator, _ = build(fast, provider)
     report = await orchestrator.run(["20031"])
     assert report.status is RunStatus.COMPLETED
     assert report.sessions[0].discovered_question_count == 3
     assert provider.grants == 1
+    assert report.metrics["questions_failed"] == 0  # auth_error reclassified as missing
+    assert report.metrics["outcomes"].get("auth_error", 0) == 0
 
 
 async def test_expired_authorization_is_reacquired(fast: Settings) -> None:
@@ -242,7 +247,9 @@ async def test_expired_authorization_without_reauth_blocks_run(fast: Settings) -
     provider = ScriptedProvider(respond, grants_left=1)
     orchestrator, repo = build(fast.model_copy(update={"max_reauthorizations_per_session": 0}), provider)
     # Probe of a known question also fails once authorization is gone:
-    provider.responder = lambda s, n, p: ENTRY_FORM if p.requested.count((s, n)) > 1 or n >= 3 else question_page(number=n)
+    provider.responder = lambda s, n, p: (
+        ENTRY_FORM if p.requested.count((s, n)) > 1 or n >= 3 else question_page(number=n)
+    )
     report = await orchestrator.run(["20031", "20262"])
     assert report.status is RunStatus.BLOCKED
     assert [s.session_code for s in report.sessions] == ["20031"]  # stops; does not continue to 20262
@@ -263,7 +270,8 @@ async def test_access_blocked_at_entry(fast: Settings) -> None:
 
 async def test_server_failure_aborts_run(fast: Settings) -> None:
     provider = ScriptedProvider(lambda s, n, p: httpx.Response(503))
-    orchestrator, repo = build(fast.model_copy(update={"max_retries": 0, "circuit_breaker_threshold": 2}), provider)
+    settings = fast.model_copy(update={"max_retries": 0, "circuit_breaker_threshold": 2})
+    orchestrator, _ = build(settings, provider)
     report = await orchestrator.run(["20031", "20262"])
     assert report.status is RunStatus.FAILED
     assert report.sessions[0].outcome is SessionOutcome.ABORTED
@@ -312,7 +320,7 @@ async def test_resume_with_postgres(fast: Settings, pg_repo: PostgresRepository)
 
     provider = ScriptedProvider(respond)
     orchestrator, _ = build(fast.model_copy(update={"concurrency": 1}), provider, pg_repo)
-    with pytest.raises(BaseException):
+    with pytest.raises(ExceptionGroup):
         await orchestrator.run(["20031"])
     assert len(await pg_repo.fetch_records()) == 3
 
