@@ -226,9 +226,9 @@ async def test_token_is_not_bought_during_a_server_pause(settings: Settings) -> 
     solved_at: list[float] = []
 
     class ClockedCaptcha(FakeAuthorizedCaptcha):
-        async def solve(self, *, site_key: str, page_url: str) -> CaptchaSolution:
+        async def solve(self, *, site_key: str, page_url: str, **challenge: object) -> CaptchaSolution:
             solved_at.append(ft.now)
-            return await super().solve(site_key=site_key, page_url=page_url)
+            return await super().solve(site_key=site_key, page_url=page_url, **challenge)
 
     async with CemClient(s, Metrics(), traffic=traffic) as client:
         await HttpFormAccessProvider(s, ClockedCaptcha()).acquire(ExamSession.from_code("20031"), client)
@@ -248,8 +248,8 @@ async def test_stale_token_is_flagged(settings: Settings, caplog: pytest.LogCapt
     _mock_cem()
 
     class SlowCaptcha(FakeAuthorizedCaptcha):
-        async def solve(self, *, site_key: str, page_url: str) -> CaptchaSolution:
-            solution = await super().solve(site_key=site_key, page_url=page_url)
+        async def solve(self, *, site_key: str, page_url: str, **challenge: object) -> CaptchaSolution:
+            solution = await super().solve(site_key=site_key, page_url=page_url, **challenge)
             solution.solved_at -= 130  # pretend it was solved 130 s ago
             return solution
 
@@ -322,3 +322,69 @@ async def test_checks_that_can_fail_happen_before_paying(settings: Settings) -> 
         with pytest.raises(AccessBlocked, match="not offered"):
             await HttpFormAccessProvider(s, captcha).acquire(ExamSession.from_code("20051"), client)
     assert captcha.calls == []  # session not in the form: nothing bought
+
+
+# --------------------------------------------------------------------------- 7. task type matches the page
+
+
+@pytest.mark.parametrize(
+    "script",
+    [
+        '<script src="https://www.google.com/recaptcha/api.js?render=6LcV3KEY"></script>',
+        '<script src="https://www.google.com/recaptcha/enterprise.js"></script>',
+    ],
+)
+@respx.mock
+async def test_unsupported_recaptcha_is_refused_before_paying(settings: Settings, script: str) -> None:
+    form = load(EDGE / "entry_form.html").replace("</body>", f"{script}</body>")
+    respx.get(CEM + "eula_pes.php").mock(return_value=httpx.Response(200))
+    respx.post(CEM + "form_pytania_pes.php").mock(return_value=httpx.Response(200, html=form))
+    captcha = FakeAuthorizedCaptcha()
+    s = settings.model_copy(update={"accept_eula": True})
+    async with CemClient(s, Metrics(), traffic=TrafficControl(s, limiter=RateLimiter(1000))) as client:
+        with pytest.raises(AccessBlocked, match="solves only reCAPTCHA v2 \\(nothing was bought\\)"):
+            await HttpFormAccessProvider(s, captcha).acquire(ExamSession.from_code("20031"), client)
+    assert captcha.calls == []
+
+
+@respx.mock
+async def test_invisible_v2_is_solved_as_invisible(settings: Settings) -> None:
+    form = load(EDGE / "entry_form.html").replace('class="g-recaptcha"', 'class="g-recaptcha" data-size="invisible"')
+    respx.get(CEM + "eula_pes.php").mock(return_value=httpx.Response(200))
+    respx.post(CEM + "form_pytania_pes.php").mock(return_value=httpx.Response(200, html=form))
+    respx.post(CEM + "wyswietl_pytania_pes.php").mock(
+        return_value=httpx.Response(200, html=load(SYNTHETIC / "20031_1.html"))
+    )
+    captcha = FakeAuthorizedCaptcha()
+    s = settings.model_copy(update={"accept_eula": True})
+    async with CemClient(s, Metrics(), traffic=TrafficControl(s, limiter=RateLimiter(1000))) as client:
+        await HttpFormAccessProvider(s, captcha).acquire(ExamSession.from_code("20031"), client)
+    assert captcha.challenges == [{"invisible": True, "api_domain": None, "data_s": None}]
+
+
+@respx.mock
+async def test_task_body_follows_the_v2_docs() -> None:
+    respx.post(f"{API}/getBalance").mock(return_value=ok(balance=1))
+    create = respx.post(f"{API}/createTask").mock(return_value=ok(taskId=1))
+    respx.post(f"{API}/getTaskResult").mock(return_value=READY)
+    ft = FakeTime()
+    provider = TwoCaptchaProvider(SecretStr(KEY), sleep=ft.sleep, clock=ft.clock)
+    await provider.solve(site_key="K", page_url="https://www.cem.edu.pl/pytcem/form_pytania_pes.php")
+    await provider.solve(site_key="K", page_url="u", invisible=True, api_domain="recaptcha.net", data_s="S")
+    import json
+
+    checkbox, special = (json.loads(c.request.content)["task"] for c in create.calls)
+    # Checkbox v2 (the CEM form): only the required fields; no userAgent (ours is not a browser UA).
+    assert checkbox == {
+        "type": "RecaptchaV2TaskProxyless",
+        "websiteURL": "https://www.cem.edu.pl/pytcem/form_pytania_pes.php",
+        "websiteKey": "K",
+    }
+    assert special == {
+        "type": "RecaptchaV2TaskProxyless",
+        "websiteURL": "u",
+        "websiteKey": "K",
+        "isInvisible": True,
+        "apiDomain": "recaptcha.net",
+        "recaptchaDataSValue": "S",
+    }

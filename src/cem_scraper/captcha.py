@@ -65,7 +65,15 @@ class CaptchaProvider(ABC):
         """True when the provider is configured and still within its budget."""
 
     @abstractmethod
-    async def solve(self, *, site_key: str, page_url: str) -> CaptchaSolution:
+    async def solve(
+        self,
+        *,
+        site_key: str,
+        page_url: str,
+        invisible: bool = False,
+        api_domain: str | None = None,
+        data_s: str | None = None,
+    ) -> CaptchaSolution:
         """Return a one-time verification token for ``page_url``."""
 
     async def report(self, solution: CaptchaSolution, *, accepted: bool) -> None:  # noqa: B027
@@ -85,7 +93,15 @@ class DisabledCaptchaProvider(CaptchaProvider):
     def available(self) -> bool:
         return False
 
-    async def solve(self, *, site_key: str, page_url: str) -> CaptchaSolution:
+    async def solve(
+        self,
+        *,
+        site_key: str,
+        page_url: str,
+        invisible: bool = False,
+        api_domain: str | None = None,
+        data_s: str | None = None,
+    ) -> CaptchaSolution:
         raise CaptchaUnavailable(
             "no CAPTCHA provider is configured: set CEM_CAPTCHA_PROVIDER=2captcha and CEM_TWOCAPTCHA_API_KEY, "
             "or use CEM_ACCESS_PROVIDER=interactive_browser and solve the reCAPTCHA yourself"
@@ -203,14 +219,29 @@ class TwoCaptchaProvider(CaptchaProvider):
         if balance <= 0:
             raise CaptchaUnavailable("2Captcha balance is empty; top it up yourself at https://2captcha.com")
 
-    async def solve(self, *, site_key: str, page_url: str) -> CaptchaSolution:
+    async def solve(
+        self,
+        *,
+        site_key: str,
+        page_url: str,
+        invisible: bool = False,
+        api_domain: str | None = None,
+        data_s: str | None = None,
+    ) -> CaptchaSolution:
         if not self._within_budget():
             raise CaptchaUnavailable(
                 f"CAPTCHA budget for this run reached ({self.solves} solves, {self.spent} spent; "
                 f"limits {self.max_solves} / {self.max_spend})"
             )
         await self._check_balance_once()
-        task = {"type": "RecaptchaV2TaskProxyless", "websiteURL": page_url, "websiteKey": site_key}
+        # https://2captcha.com/api-docs/recaptcha-v2 ; optional fields only when the page needs them.
+        task: dict[str, Any] = {"type": "RecaptchaV2TaskProxyless", "websiteURL": page_url, "websiteKey": site_key}
+        if invisible:
+            task["isInvisible"] = True
+        if api_domain:
+            task["apiDomain"] = api_domain
+        if data_s:
+            task["recaptchaDataSValue"] = data_s
         last_error = "no attempt"
         for attempt in range(self.max_tasks_per_solve):
             try:

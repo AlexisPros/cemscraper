@@ -311,7 +311,9 @@ async def cmd_verify_sessions(args: argparse.Namespace) -> int:
         ok &= label is not None
     spec = form.specialization_options.get(settings.specialization_code)
     print(f"specialization {settings.specialization_code}: {spec or 'not in static options'}")
-    print(f"reCAPTCHA sitekey present: {bool(form.recaptcha_sitekey)}")
+    rc = form.recaptcha
+    kind = f"{rc.version}{' invisible' if rc.invisible else ' checkbox' if rc.version == 'v2' else ''}"
+    print(f"reCAPTCHA: {kind}, sitekey present: {bool(rc.sitekey)}, loaded from {rc.api_domain or 'google.com'}")
     return EXIT_OK if ok else EXIT_ERROR
 
 

@@ -287,7 +287,9 @@ class Orchestrator:
             await self.repo.set_session_status(state.id, CollectionStatus.BLOCKED, last_error=str(exc))
             report.outcome, report.error = SessionOutcome.BLOCKED, str(exc)
             return report
-        await self.repo.set_session_status(state.id, CollectionStatus.IN_PROGRESS)
+        await self.repo.set_session_status(
+            state.id, CollectionStatus.IN_PROGRESS, expected_question_count=auth.grant.question_limit
+        )
 
         try:
             candidates = todo if only_failed else None
@@ -430,6 +432,11 @@ class Orchestrator:
         discovery = candidates is None
         pending = iter(candidates or [])
         limit = settings.max_question_number
+        form_limit = auth.grant.question_limit
+        if discovery and form_limit:
+            # The official form lists question numbers 1..N: nothing exists beyond N, so there is
+            # no need to probe past it (which would only return the EULA page).
+            limit = min(limit, form_limit)
         highest = max(done, default=0)
         streak = 0
         frontier = 1  # discovery: next number whose outcome is folded into the streak
@@ -523,7 +530,9 @@ class Orchestrator:
             if in_flight:
                 await asyncio.gather(*in_flight, return_exceptions=True)
 
-        if discovery and not stopped and limit == settings.max_question_number:
+        if discovery and not stopped and form_limit and limit == form_limit:
+            log.info("%s: collected up to the form's last question number %d", auth.session.label, limit)
+        elif discovery and not stopped and limit == settings.max_question_number:
             log.warning("%s: reached max question number %d without finding the end", auth.session.label, limit)
         return auth, highest
 

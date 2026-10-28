@@ -119,12 +119,32 @@ class ParsedPage:
 
 
 @dataclass
+class RecaptchaInfo:
+    """Which reCAPTCHA a page uses, by the signs 2Captcha's docs name.
+
+    - v2 checkbox: ``api.js`` + ``div.g-recaptcha[data-sitekey]`` (live CEM form, iframe ``size=normal``)
+    - v2 invisible: the same with ``data-size="invisible"`` (iframe ``size=invisible``)
+    - v3: ``api.js?render=<sitekey>`` (score based, no checkbox)
+    - Enterprise: ``enterprise.js`` or ``grecaptcha.enterprise``
+    """
+
+    version: str  # "v2", "v3", "enterprise" or "none"
+    sitekey: str | None = None
+    invisible: bool = False
+    api_domain: str | None = None  # "recaptcha.net" when loaded from there; None = google.com
+    data_s: str | None = None
+
+
+@dataclass
 class EntryForm:
     action: str | None
     fields: dict[str, str]
     recaptcha_sitekey: str | None
     session_options: dict[str, str]
     specialization_options: dict[str, str]
+    recaptcha: RecaptchaInfo = field(default_factory=lambda: RecaptchaInfo("none"))
+    # Highest number in the form's "Nr pytania" list (live PES form: 1..120), if it is a list.
+    max_question_number: int | None = None
 
 
 # --------------------------------------------------------------------------- helpers
@@ -514,6 +534,31 @@ def parse_question_page(html: str, expected_number: int | None = None) -> Parsed
 # --------------------------------------------------------------------------- entry form
 
 
+V3_RENDER_RE = re.compile(r"recaptcha/api\.js\?[^\"'\s]*\brender=(?!explicit\b)([\w-]+)")
+ANCHOR_SIZE_RE = re.compile(r"recaptcha/api2/anchor\?[^\"'\s]*\bsize=(\w+)")
+
+
+def detect_recaptcha(soup: BeautifulSoup) -> RecaptchaInfo:
+    sources = [attr(s, "src") for s in soup.find_all("script") if attr(s, "src")]
+    sources += [attr(f, "src") for f in soup.find_all("iframe") if attr(f, "src")]
+    inline = " ".join(s.get_text() for s in soup.find_all("script") if not attr(s, "src"))
+    widget = soup.select_one(".g-recaptcha[data-sitekey], [data-sitekey]")
+    sitekey = attr(widget, "data-sitekey") or None if widget else None
+    api_domain = "recaptcha.net" if any("recaptcha.net" in src for src in sources) else None
+    if any("recaptcha/enterprise.js" in src for src in sources) or "grecaptcha.enterprise" in inline:
+        return RecaptchaInfo("enterprise", sitekey, api_domain=api_domain)
+    for src in sources:
+        render = V3_RENDER_RE.search(src)
+        if render:
+            return RecaptchaInfo("v3", sitekey or render.group(1), api_domain=api_domain)
+    if widget is None and not any("recaptcha/api" in src for src in sources):
+        return RecaptchaInfo("none")
+    anchor_sizes = {m.group(1) for src in sources if (m := ANCHOR_SIZE_RE.search(src))}
+    invisible = (widget is not None and attr(widget, "data-size") == "invisible") or "invisible" in anchor_sizes
+    data_s = (attr(widget, "data-s") or None) if widget is not None else None
+    return RecaptchaInfo("v2", sitekey, invisible=invisible, api_domain=api_domain, data_s=data_s)
+
+
 def parse_entry_form(html: str) -> EntryForm:
     """Read the official session-selection form (fields, select options, reCAPTCHA sitekey).
 
@@ -557,11 +602,13 @@ def parse_entry_form(html: str) -> EntryForm:
             if attr(opt, "value").strip()
         }
 
-    sitekey_el = soup.select_one("[data-sitekey]")
+    recaptcha = detect_recaptcha(soup)
     return EntryForm(
         action=attr(form, "action") or None if form else None,
         fields=fields,
-        recaptcha_sitekey=attr(sitekey_el, "data-sitekey") or None if sitekey_el else None,
+        recaptcha_sitekey=recaptcha.sitekey,
         session_options=options_of("sesja"),
         specialization_options=options_of("specjalizacja"),
+        recaptcha=recaptcha,
+        max_question_number=max((int(v) for v in options_of("nr_pytania") if v.isdigit()), default=None),
     )

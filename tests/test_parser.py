@@ -430,3 +430,66 @@ def test_entry_form_includes_named_submit_button_like_a_browser() -> None:
     }
     unnamed = parse_entry_form(load(EDGE / "entry_form.html"))
     assert "submit" not in unnamed.fields  # an unnamed button sends nothing
+
+
+# --------------------------------------------------------------------------- reCAPTCHA variant (2Captcha docs' signs)
+
+API_JS = '<script src="https://www.google.com/recaptcha/api.js"></script>'
+
+
+@pytest.mark.parametrize(
+    ("markup", "version", "invisible", "api_domain", "data_s"),
+    [
+        # Live CEM form: api.js + visible widget; the rendered iframe says size=normal.
+        (
+            API_JS + '<div class="g-recaptcha" data-sitekey="6LeeKEY"></div>'
+            '<iframe src="https://www.google.com/recaptcha/api2/anchor?ar=1&k=6LeeKEY&size=normal&execute-ms=30000">'
+            "</iframe>",
+            "v2",
+            False,
+            None,
+            None,
+        ),
+        (API_JS + '<div class="g-recaptcha" data-sitekey="K" data-size="invisible"></div>', "v2", True, None, None),
+        (API_JS + '<div class="g-recaptcha" data-sitekey="K" data-s="SVALUE"></div>', "v2", False, None, "SVALUE"),
+        (
+            '<script src="https://www.recaptcha.net/recaptcha/api.js"></script>'
+            '<div class="g-recaptcha" data-sitekey="K">',
+            "v2",
+            False,
+            "recaptcha.net",
+            None,
+        ),
+        ('<script src="https://www.google.com/recaptcha/api.js?render=6LcV3KEY"></script>', "v3", False, None, None),
+        (
+            '<script src="https://www.google.com/recaptcha/enterprise.js"></script>'
+            '<div class="g-recaptcha" data-sitekey="K">',
+            "enterprise",
+            False,
+            None,
+            None,
+        ),
+        ('<script src="https://www.google.com/recaptcha/api.js?render=explicit"></script>', "v2", False, None, None),
+        ("<form><select name=sesja></select></form>", "none", False, None, None),
+    ],
+)
+def test_recaptcha_variant_detection(
+    markup: str, version: str, invisible: bool, api_domain: str | None, data_s: str | None
+) -> None:
+    info = parse_entry_form(f"<html><body>{markup}</body></html>").recaptcha
+    assert (info.version, info.invisible, info.api_domain, info.data_s) == (version, invisible, api_domain, data_s)
+
+
+def test_v3_sitekey_taken_from_render_parameter() -> None:
+    form = parse_entry_form('<script src="https://www.google.com/recaptcha/api.js?render=6LcV3KEY&hl=pl"></script>')
+    assert form.recaptcha.sitekey == form.recaptcha_sitekey == "6LcV3KEY"
+
+
+def test_form_question_range_from_nr_pytania_list() -> None:
+    options = "".join(f'<option value="{n}">{n}</option>' for n in range(1, 121))
+    html = (
+        '<form><select name="sesja"><option value="20031">w</option></select>'
+        f'<select name="nr_pytania">{options}</select></form>'
+    )
+    assert parse_entry_form(html).max_question_number == 120
+    assert parse_entry_form(load(EDGE / "entry_form.html")).max_question_number is None  # a text input: unknown

@@ -106,6 +106,8 @@ class AccessGrant:
     transport: httpx.AsyncBaseTransport | None = field(default=None, repr=False)
     # Absolute URL of the question page the site served after the form submission.
     question_url: str | None = None
+    # The highest question number the official form offers; nothing beyond it is requested.
+    question_limit: int | None = None
 
 
 class AccessProvider(ABC):
@@ -193,6 +195,12 @@ class HttpFormAccessProvider(AccessProvider):
             verify_form_supports(form.session_options, form.specialization_options, session)
             if not form.recaptcha_sitekey:
                 raise AccessBlocked("session-entry form has no reCAPTCHA sitekey; page layout changed?")
+            challenge = form.recaptcha
+            if challenge.version != "v2":
+                raise AccessBlocked(
+                    f"the form now uses reCAPTCHA {challenge.version}; this integration solves only reCAPTCHA v2 "
+                    "(nothing was bought)"
+                )
             fields = dict(form.fields) | {
                 "sesja": session.session_code,
                 "typ": EXAM_TYPE,
@@ -202,7 +210,13 @@ class HttpFormAccessProvider(AccessProvider):
             # Everything that can fail cheaply has been checked; now wait out any server pause
             # so the token (valid ~2 min) is not bought too early, then pay for it.
             await client.traffic.limiter.idle()
-            solution = await self.captcha.solve(site_key=form.recaptcha_sitekey, page_url=form_page.url)
+            solution = await self.captcha.solve(
+                site_key=form.recaptcha_sitekey,
+                page_url=form_page.url,
+                invisible=challenge.invisible,
+                api_domain=challenge.api_domain,
+                data_s=challenge.data_s,
+            )
             fields["g-recaptcha-response"] = solution.token
             age = solution.age()
             log.info("submitting the form %.0fs after the CAPTCHA was solved", age)
@@ -227,7 +241,11 @@ class HttpFormAccessProvider(AccessProvider):
         verify_shown_session(first.html, session)
         log.info("session %s entered automatically", session.label)
         return AccessGrant(
-            session_code=session.session_code, provider=self.name, first_page_html=first.html, question_url=first.url
+            session_code=session.session_code,
+            provider=self.name,
+            first_page_html=first.html,
+            question_url=first.url,
+            question_limit=form.max_question_number,
         )
 
     async def close(self) -> None:
@@ -341,7 +359,9 @@ class InteractiveBrowserAccessProvider(AccessProvider):
                         "and click 'Wyświetl pytania'."
                     )
             await page.wait_for_selector("select[name=sesja], .g-recaptcha", timeout=timeout_ms)
-            describe_form(self.settings, await page.content(), session)
+            form_html = await page.content()
+            describe_form(self.settings, form_html, session)
+            question_limit = parse_entry_form(form_html).max_question_number
             await self._prefill(page, session)
             log.warning(
                 "ACTION REQUIRED: in the browser window, check %s / Psychiatria / question 1, "
@@ -382,6 +402,7 @@ class InteractiveBrowserAccessProvider(AccessProvider):
             first_page_html=html,
             transport=transport,
             question_url=question_url,
+            question_limit=question_limit,
         )
 
     async def _prefill(self, page: Any, session: ExamSession) -> None:

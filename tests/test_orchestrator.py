@@ -44,10 +44,18 @@ class ScriptedProvider(AccessProvider):
 
     name = "scripted"
 
-    def __init__(self, responder: Responder, *, grants_left: int | None = None, first_page: bool = False) -> None:
+    def __init__(
+        self,
+        responder: Responder,
+        *,
+        grants_left: int | None = None,
+        first_page: bool = False,
+        question_limit: int | None = None,
+    ) -> None:
         self.responder = responder
         self.grants_left = grants_left
         self.first_page = first_page
+        self.question_limit = question_limit
         self.grants = 0
         self.requested: list[tuple[str, int]] = []
 
@@ -68,7 +76,12 @@ class ScriptedProvider(AccessProvider):
             self.grants_left -= 1
         self.grants += 1
         first = question_page(number=1) if self.first_page else None
-        return AccessGrant(session_code=session.session_code, provider=self.name, first_page_html=first)
+        return AccessGrant(
+            session_code=session.session_code,
+            provider=self.name,
+            first_page_html=first,
+            question_limit=self.question_limit,
+        )
 
     def numbers(self, session: str = "20031") -> list[int]:
         return [n for s, n in self.requested if s == session]
@@ -501,3 +514,41 @@ async def test_reparse_skips_non_question_snapshots(fast: Settings, tmp_path) ->
     await build(fast, ScriptedProvider(respond), repo)[0].reparse(["20031"], tmp_path)
     state = await repo.ensure_session(ExamSession.from_code("20031"))
     assert (await repo.attempt_statuses(state.id))[2] is AttemptStatus.UNEXPECTED_CONTENT  # untouched
+
+
+def live_like(total: int) -> Responder:
+    """Like cem.edu.pl: numbers past the end answer with the entry form / EULA page."""
+
+    def respond(session: str, number: int, _: ScriptedProvider) -> str:
+        return question_page(number=number) if number <= total else ENTRY_FORM
+
+    return respond
+
+
+async def test_form_question_range_ends_the_session_without_extra_requests(fast: Settings) -> None:
+    provider = ScriptedProvider(live_like(6), question_limit=6)
+    orchestrator, repo = build(fast, provider)
+    report = await orchestrator.run(["20031"])
+    assert sorted(provider.numbers()) == [1, 2, 3, 4, 5, 6]  # nothing past the form's last number, no probe
+    assert report.sessions[0].outcome is SessionOutcome.COMPLETED
+    state = await repo.ensure_session(ExamSession.from_code("20031"))
+    assert (state.discovered_question_count, state.expected_question_count) == (6, 6)
+
+
+async def test_without_a_form_range_the_end_is_still_discovered(fast: Settings) -> None:
+    provider = ScriptedProvider(live_like(6))  # e.g. manual_chrome: the tool never sees the form
+    orchestrator, _ = build(fast, provider)
+    report = await orchestrator.run(["20031"])
+    assert max(provider.numbers()) > 6 and report.sessions[0].discovered_question_count == 6
+
+
+async def test_session_shorter_than_the_form_range(fast: Settings) -> None:
+    provider = ScriptedProvider(live_like(4), question_limit=6)
+    orchestrator, repo = build(fast, provider)
+    report = await orchestrator.run(["20031"])
+    assert max(provider.numbers()) == 6  # still never beyond the form's range
+    assert report.sessions[0].discovered_question_count == 4
+    assert report.sessions[0].outcome is SessionOutcome.COMPLETED
+    state = await repo.ensure_session(ExamSession.from_code("20031"))
+    statuses = await repo.attempt_statuses(state.id)
+    assert statuses[5] is statuses[6] is AttemptStatus.MISSING  # confirmed by the probe, not assumed

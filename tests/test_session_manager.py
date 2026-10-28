@@ -32,14 +32,16 @@ class FakeAuthorizedCaptcha(CaptchaProvider):
 
     def __init__(self) -> None:
         self.calls: list[tuple[str, str]] = []
+        self.challenges: list[dict[str, object]] = []
         self.reports: list[bool] = []
 
     @property
     def available(self) -> bool:
         return True
 
-    async def solve(self, *, site_key: str, page_url: str) -> CaptchaSolution:
+    async def solve(self, *, site_key: str, page_url: str, **challenge: object) -> CaptchaSolution:
         self.calls.append((site_key, page_url))
+        self.challenges.append(challenge)
         return CaptchaSolution(token="dummy-test-token", task_id="1")
 
     async def report(self, solution: CaptchaSolution, *, accepted: bool) -> None:
@@ -185,3 +187,20 @@ async def test_interactive_close_tolerates_a_browser_killed_by_ctrl_c(settings: 
     provider._context, provider._browser, provider._playwright = Gone(), Gone(), Gone()
     await provider.close()  # must not raise
     assert Gone.closed == 3 and provider._context is None
+
+
+@respx.mock
+async def test_http_form_grant_carries_the_form_question_range(settings: Settings) -> None:
+    options = "".join(f'<option value="{n}">{n}</option>' for n in range(1, 121))
+    form = load(EDGE / "entry_form.html").replace(
+        '<input type="text" name="nr_pytania" value="1">', f'<select name="nr_pytania">{options}</select>'
+    )
+    respx.get(BASE + "eula_pes.php").mock(return_value=httpx.Response(200))
+    respx.post(BASE + "form_pytania_pes.php").mock(return_value=httpx.Response(200, html=form))
+    respx.post(BASE + "wyswietl_pytania_pes.php").mock(
+        return_value=httpx.Response(200, html=load(SYNTHETIC / "20031_1.html"))
+    )
+    s = http_settings(settings)
+    async with CemClient(s, Metrics()) as client:
+        grant = await HttpFormAccessProvider(s, FakeAuthorizedCaptcha()).acquire(ExamSession.from_code("20031"), client)
+    assert grant.question_limit == 120

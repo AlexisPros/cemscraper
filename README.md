@@ -115,6 +115,7 @@ session is collected, so its 20–60 s solve time is hidden. Price: 4.49–13.49
 1000 reCAPTCHA v2, so a full run (~23 sessions) costs well under 1 PLN.
 
 Safety rails, each pinned by a test in `tests/test_money_safety.py`:
+- **The task type matches the page.** The form's reCAPTCHA is identified by the signs in 2Captcha's docs ([v2](https://2captcha.com/api-docs/recaptcha-v2), [v3](https://2captcha.com/api-docs/recaptcha-v3)). The live CEM form is v2 checkbox (`api.js`, `div.g-recaptcha[data-sitekey]`, iframe `size=normal`), solved as `RecaptchaV2TaskProxyless` with only the required fields. Invisible v2, `recaptcha.net` and `data-s` add `isInvisible`, `apiDomain` and `recaptchaDataSValue`. If the site switches to v3 (`api.js?render=…`) or Enterprise (`enterprise.js`), the run stops **before buying anything**. `cem-scraper verify-sessions` shows the detected type.
 - **One task is never paid twice.** If `createTask` may have reached 2Captcha (read timeout, dropped connection, HTTP error), it is not resent. Only a request that never left the machine is retried. Polling and balance calls are free and may retry.
 - **A bought token is used exactly once.** The form submission carrying it is never retried, because the token is single-use.
 - **The token is bought fresh.** Every check that can fail is done first (EULA consent, session offered by the form, sitekey present), and any server `Retry-After` pause is waited out *before* buying, because a token is valid for about 2 minutes. The token's age at submission is logged.
@@ -162,6 +163,14 @@ Questions are requested from 1 upward through the sliding window. A session
 ends after `CEM_MISSING_STREAK_TO_STOP` consecutive missing questions past the
 highest one found. Gaps are recorded as `missing`, and one failure never stops
 collection. If a page reports a total ("… z 120"), that total also bounds the search.
+
+When the tool sees the official form (`http_form`, `interactive_browser`), the form's own
+«Nr pytania» list sets the range: on the live PES form it is 1…120. Nothing past it is
+requested, so a session ends at its last question and the next one starts right away. The
+value is stored in `exam_sessions.expected_question_count`. `manual_chrome` never sees the
+form, so there the end is discovered as described above: the first page past the end is the
+EULA page, a known question is re-requested to rule out an expired session, and three
+missing numbers in a row end the session.
 
 Each question gets one persisted status:
 
@@ -354,7 +363,7 @@ There are 124 tests: parser, models, HTTP client, 2Captcha client, full automati
    - The entry is `eula_pes.php` → `form_pytania_pes.php` → `wyswietl_pytania_pes.php`. Opening the form directly leads to the *general* form (`eula.php` / `form_pytania.php`, a shorter session list), so the tool always starts at `eula_pes.php` and follows whichever question URL the site uses.
    - The PES form offers 38 sessions (wiosna 2003 … jesień 2026). All 23 targets and specialization 725 are confirmed (`verify-sessions`).
    - The header `Pytanie nr N - PES Psychiatria w sesji wiosna 2003` verifies both the question number and the session.
-   - Numbers past the end (121+) return the EULA page. The tool recognizes them as missing by re-checking a known question.
+   - Numbers past the end (121+) return the EULA page. The form lists 1…120, so in `http_form` / `interactive_browser` they are never requested. In `manual_chrome` they are recognized as missing by re-checking a known question.
    - Annulled questions show answer `X` and `-` statistics. They are stored as `needs_review` instead of failing.
    - The session cookie works outside the browser. Question pages take a steady ~11 s; the adaptive limit rose to 4, giving about 6 minutes per 120-question session.
    - Saved snapshots can be reprocessed offline after a parser fix with `cem-scraper reparse`.
