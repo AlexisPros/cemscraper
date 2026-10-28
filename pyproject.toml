@@ -1,0 +1,44 @@
+[project]
+name = "cem-scraper"
+version = "0.1.0"
+description = "Collector for publicly published CEM PES Psychiatry examination questions (Spring 2003 - Autumn 2013, Autumn 2026)."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "httpx>=0.27",
+    "beautifulsoup4>=4.12",
+    "lxml>=5.2",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.3",
+    "psycopg[binary,pool]>=3.2",
+]
+
+[project.optional-dependencies]
+browser = ["playwright>=1.45"]
+
+[project.scripts]
+cem-scraper = "cem_scraper.main:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.2",
+    "pytest-asyncio>=0.23",
+    "respx>=0.21",
+    "pgserver>=0.1.4; sys_platform != 'win32'",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/cem_scraper"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"migrations" = "cem_scraper/migrations"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+markers = ["db: tests requiring a PostgreSQL server"]

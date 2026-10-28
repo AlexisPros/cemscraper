@@ -1,0 +1,45 @@
+<!-- SYNTHETIC FIXTURE: structure from the spec, not an authentic CEM page. Encoded ISO-8859-2. -->
+<html><head><meta http-equiv="Content-Type" content="text/html; charset=iso-8859-2"><title>Pytania PES</title></head>
+<body>
+<div class="marginesy">
+  <div>
+    <p>Baza pytań testowych PES</p>
+    <center>Sesja: Wiosna 2003 &nbsp; Psychiatria &nbsp; Pytanie nr 1</center>
+    <br>
+    <p>
+        Zanik jąder ogoniastych i soczewkowatych daje charakterystyczny miseczkowaty
+        kształt rogów czołowych komór bocznych w badaniu MR w:
+    </p>
+    <br>
+    <p><b>A.</b> pląsawicy Huntingtona.</p>
+    <br>
+    <p><b>B.</b> chorobie Parkinsona.</p>
+    <br>
+    <p><b>C.</b> chorobie Alzheimera.</p>
+    <br>
+    <p><b>D.</b> chorobie Picka.</p>
+    <br>
+    <p><b>E.</b> encefalopatii Wernickego.</p>
+    <br>
+    <input type="button" value="Odpowiedź prawidłowa" onclick="pokaz('odpowiedz1')">
+    <input type="button" value="Statystyki" onclick="pokaz('statystyki1')">
+    <div id="odpowiedz1" style="display: none;">
+      <p>Prawidłowa odpowiedź to: A</p>
+      <br>
+    </div>
+    <div id="statystyki1" style="display: none;">
+      <table border="1">
+        <tr><th>Procent odp. A</th><th>Procent odp. B</th><th>Procent odp. C</th><th>Procent odp. D</th><th>Procent odp. E</th><th>Wskaźnik trudności</th></tr>
+        <tr><td>84.2</td><td>8.8</td><td>1.8</td><td>3.5</td><td>1.8</td><td>0.900</td></tr>
+      </table>
+    </div>
+  </div>
+</div>
+<form method="post" action="wyswietl_pytania_pes.php">
+  <input type="hidden" name="autoryzacja" value="1">
+  <input type="hidden" name="sesja" value="20031">
+  <input type="hidden" name="typ" value="PES">
+  <input type="hidden" name="specjalizacja" value="725">
+  <input type="hidden" name="nr_pytania" value="1">
+</form>
+</body></html>

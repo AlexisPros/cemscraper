@@ -1,0 +1,212 @@
+from __future__ import annotations
+
+import logging
+from datetime import UTC, datetime, timedelta
+from email.utils import format_datetime
+from urllib.parse import parse_qs
+
+import httpx
+import pytest
+import respx
+
+from cem_scraper.client import (
+    AccessDenied,
+    CemClient,
+    RateLimiter,
+    RequestFailed,
+    ServerThrottled,
+    ServerUnavailable,
+    UnexpectedStatus,
+    parse_retry_after,
+    sanitize_snapshot,
+)
+from cem_scraper.config import Settings
+from cem_scraper.logging_config import RedactingFilter, redact
+from cem_scraper.metrics import Metrics
+from cem_scraper.models import ExamSession
+
+QUESTION_URL = "https://www.cem.edu.pl/pytcem/wyswietl_pytania_pes.php"
+
+
+class FakeSleep:
+    def __init__(self) -> None:
+        self.calls: list[float] = []
+
+    async def __call__(self, seconds: float) -> None:
+        self.calls.append(seconds)
+
+
+@pytest.fixture
+def sleep() -> FakeSleep:
+    return FakeSleep()
+
+
+@pytest.fixture
+def client_factory(settings: Settings, sleep: FakeSleep):
+    clients: list[CemClient] = []
+
+    def make(**overrides: object) -> CemClient:
+        s = settings.model_copy(update=overrides)
+        limiter = RateLimiter(1000, sleep=FakeSleep())  # keep backoff sleeps separate from spacing
+        client = CemClient(s, Metrics(), sleep=sleep, rate_limiter=limiter)
+        clients.append(client)
+        return client
+
+    yield make
+
+
+@respx.mock
+async def test_fetch_question_posts_observed_payload(client_factory) -> None:
+    route = respx.post(QUESTION_URL).mock(return_value=httpx.Response(200, html="<p>ok</p>"))
+    client = client_factory()
+    page = await client.fetch_question(ExamSession.from_code("20262"), 2)
+    assert page.status_code == 200 and "ok" in page.html
+    sent = {k: v[0] for k, v in parse_qs(route.calls[0].request.content.decode()).items()}
+    assert sent == {
+        "autoryzacja": "1", "sesja": "20262", "typ": "PES", "specjalizacja": "725",
+        "nr_pytania": "2", "gdzieidziesz": "doprzodu",
+    }
+    assert "g-recaptcha-response" not in sent
+    assert client.metrics.request_successes == 1
+
+
+@respx.mock
+async def test_retries_transient_errors_with_backoff(client_factory, sleep: FakeSleep) -> None:
+    respx.post(QUESTION_URL).mock(
+        side_effect=[httpx.Response(503), httpx.ConnectTimeout("slow"), httpx.Response(200, html="ok")]
+    )
+    client = client_factory()
+    page = await client.post("wyswietl_pytania_pes.php", {})
+    assert page.html == "ok"
+    assert client.metrics.retries == 2
+    assert len(sleep.calls) == 2 and all(0 <= s <= 0.02 for s in sleep.calls)
+
+
+@respx.mock
+async def test_honours_retry_after(client_factory, sleep: FakeSleep) -> None:
+    respx.post(QUESTION_URL).mock(
+        side_effect=[httpx.Response(429, headers={"Retry-After": "7"}), httpx.Response(200, html="ok")]
+    )
+    await client_factory().post("wyswietl_pytania_pes.php", {})
+    assert sleep.calls == [7.0]
+
+
+@respx.mock
+async def test_excessive_retry_after_stops(client_factory) -> None:
+    respx.post(QUESTION_URL).mock(return_value=httpx.Response(429, headers={"Retry-After": "3600"}))
+    with pytest.raises(ServerThrottled):
+        await client_factory().post("wyswietl_pytania_pes.php", {})
+
+
+@respx.mock
+async def test_access_denied_is_not_retried(client_factory) -> None:
+    route = respx.post(QUESTION_URL).mock(return_value=httpx.Response(403))
+    with pytest.raises(AccessDenied):
+        await client_factory().post("wyswietl_pytania_pes.php", {})
+    assert route.call_count == 1
+
+
+@respx.mock
+async def test_non_retryable_status(client_factory) -> None:
+    route = respx.post(QUESTION_URL).mock(return_value=httpx.Response(404))
+    with pytest.raises(UnexpectedStatus):
+        await client_factory().post("wyswietl_pytania_pes.php", {})
+    assert route.call_count == 1
+
+
+@respx.mock
+async def test_exhausted_retries_then_circuit_breaker(client_factory) -> None:
+    respx.post(QUESTION_URL).mock(side_effect=httpx.ReadTimeout("timeout"))
+    client = client_factory(max_retries=1, circuit_breaker_threshold=2)
+    with pytest.raises(RequestFailed):
+        await client.post("wyswietl_pytania_pes.php", {})
+    with pytest.raises(ServerUnavailable):
+        await client.post("wyswietl_pytania_pes.php", {})
+    with pytest.raises(ServerUnavailable, match="circuit breaker open"):
+        await client.post("wyswietl_pytania_pes.php", {})
+    assert client.metrics.request_failures == 4
+
+
+@respx.mock
+async def test_success_resets_failure_counter(client_factory) -> None:
+    respx.post(QUESTION_URL).mock(
+        side_effect=[httpx.ReadTimeout("t"), httpx.Response(200), httpx.ReadTimeout("t"), httpx.Response(200)]
+    )
+    client = client_factory(max_retries=0, circuit_breaker_threshold=2)
+    with pytest.raises(RequestFailed):
+        await client.post("wyswietl_pytania_pes.php", {})
+    await client.post("wyswietl_pytania_pes.php", {})
+    with pytest.raises(RequestFailed):  # not ServerUnavailable: the counter was reset
+        await client.post("wyswietl_pytania_pes.php", {})
+
+
+@respx.mock
+async def test_decodes_declared_charset(client_factory) -> None:
+    body = "Zażółć gęślą jaźń".encode("iso-8859-2")
+    respx.post(QUESTION_URL).mock(
+        return_value=httpx.Response(200, content=body, headers={"Content-Type": "text/html; charset=ISO-8859-2"})
+    )
+    page = await client_factory().post("wyswietl_pytania_pes.php", {})
+    assert page.html == "Zażółć gęślą jaźń"
+
+
+async def test_rate_limiter_spaces_requests() -> None:
+    now = [0.0]
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    limiter = RateLimiter(2.0, clock=lambda: now[0], sleep=fake_sleep)
+    for _ in range(3):
+        await limiter.acquire()
+    assert sleeps == [0.5, 1.0]
+
+
+async def test_concurrency_is_capped(settings: Settings) -> None:
+    import asyncio
+
+    active = peak = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        await asyncio.sleep(0.01)
+        active -= 1
+        return httpx.Response(200)
+
+    s = settings.model_copy(update={"concurrency": 2})
+    client = CemClient(s, Metrics(), transport=httpx.MockTransport(handler), rate_limiter=RateLimiter(1000))
+    await asyncio.gather(*(client.get("x") for _ in range(6)))
+    await client.aclose()
+    assert peak == 2
+
+
+def test_parse_retry_after_formats() -> None:
+    now = datetime(2026, 10, 28, tzinfo=UTC)
+    assert parse_retry_after("12") == 12.0
+    assert parse_retry_after(format_datetime(now + timedelta(seconds=30)), now=now) == 30.0
+    assert parse_retry_after("garbage") is None
+    assert parse_retry_after(None) is None
+
+
+def test_snapshot_sanitisation_blanks_tokens() -> None:
+    html = (
+        '<input type="hidden" name="g-recaptcha-response" value="SECRET1">'
+        '<input type="hidden" name="csrf_token" value="SECRET2"><input name="sesja" value="20031">'
+        '<textarea name="g-recaptcha-response">SECRET3</textarea>'
+    )
+    cleaned = sanitize_snapshot(html)
+    assert "SECRET" not in cleaned and 'value="20031"' in cleaned
+
+
+def test_log_redaction(caplog: pytest.LogCaptureFixture) -> None:
+    assert "abc123" not in redact("Cookie: PHPSESSID=abc123")
+    assert "tok" not in redact("data g-recaptcha-response=tok&x=1")
+    assert "pw" not in redact("postgresql://cem:pw@localhost/cem")
+    logger = logging.getLogger("redaction-test")
+    logger.addFilter(RedactingFilter())
+    with caplog.at_level(logging.INFO):
+        logger.info("sent %s", "g-recaptcha-response=verysecret")
+    assert "verysecret" not in caplog.text
