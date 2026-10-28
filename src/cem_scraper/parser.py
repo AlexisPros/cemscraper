@@ -37,13 +37,19 @@ from cem_scraper.models import (
 )
 
 ANSWER_PHRASE_RE = re.compile(r"\s*Prawidłowa\s+odpowiedź\s+to\s*:?\s*$", re.IGNORECASE)
-ANSWER_LETTER_RE = re.compile(r"Prawidłowa\s+odpowiedź\s+to\s*:?\s*([A-J])\b", re.IGNORECASE)
+ANSWER_LETTER_RE = re.compile(r"Prawidłowa\s+odpowiedź\s+to\s*:?\s*([A-JX])\b", re.IGNORECASE)
+# Seen live (Spring 2003 q48): annulled questions show answer "X" and "-" for every statistic.
+ANNULLED_ISSUE = "question annulled by CEM (correct answer marked X)"
+NOT_PUBLISHED = {"-", "–", "—", ""}
 OPTION_LABEL_RE = re.compile(r"^\s*([A-J])\s*[.)]\s*$")
-HIDDEN_CONTAINER_ID_RE = re.compile(r"^(odpowiedz|statystyki)", re.IGNORECASE)
+HIDDEN_CONTAINER_ID_RE = re.compile(r"^(odpowiedz|statystyki|uwagi)", re.IGNORECASE)
 QUESTION_NUMBER_PATTERNS = [
     re.compile(r"pytani\w*\s*(?:nr\.?|numer)?\s*:?\s*(\d{1,3})\b", re.IGNORECASE),
     re.compile(r"\bnr\.?\s*(\d{1,3})\b", re.IGNORECASE),
 ]
+# Real page header (seen on cem.edu.pl): "Pytanie nr 1 - PES Psychiatria w sesji wiosna 2003".
+HEADER_NUMBER_RE = re.compile(r"pytanie\s+nr\.?\s*(\d{1,3})\b", re.IGNORECASE)
+SESSION_HEADER_RE = re.compile(r"w\s+sesji\s+(wiosna|jesie[ńn])\s+(\d{4})", re.IGNORECASE)
 QUESTION_TOTAL_RE = re.compile(r"\b(\d{1,3})\s*(?:z|/|of)\s*(\d{1,3})\b", re.IGNORECASE)
 PERCENT_HEADER_RE = re.compile(r"^procent\s*odp\w*\s*([a-e])$")
 DIFFICULTY_HEADER_RE = re.compile(r"^wskaznik\s*trudnosci")
@@ -293,7 +299,33 @@ def _find_question_number(root: Tag, option_a: Tag) -> tuple[int | None, int | N
                 number = int(match.group(1))
                 total = int(total_match.group(2)) if total_match and int(total_match.group(1)) == number else None
                 return number, total
-    return None, None
+    # Fallback: the header may not be a <center> ("Pytanie nr 1 - PES Psychiatria w sesji ...").
+    match = HEADER_NUMBER_RE.search(_header_text(root))
+    return (int(match.group(1)), None) if match else (None, None)
+
+
+def _header_text(root: Tag) -> str:
+    """Visible text of the question container, without the hidden answer/statistics blocks."""
+    parts = []
+    for node in root.find_all(string=True):
+        parent = node.parent
+        if (
+            isinstance(parent, Tag)
+            and parent.name not in ("script", "style")
+            and not _in_hidden_container(parent, root)
+        ):
+            parts.append(str(node))
+    return " ".join(" ".join(parts).split())
+
+
+def detect_session_code(html_or_soup: str | BeautifulSoup) -> str | None:
+    """Session code from the page header ("... w sesji wiosna 2003" -> "20031"), if present."""
+    soup = make_soup(html_or_soup) if isinstance(html_or_soup, str) else html_or_soup
+    match = SESSION_HEADER_RE.search(" ".join(soup.get_text(" ").split()))
+    if match is None:
+        return None
+    half = "1" if match.group(1).lower() == "wiosna" else "2"
+    return f"{match.group(2)}{half}"
 
 
 def _question_paragraphs(option_a: Tag) -> list[Tag]:
@@ -354,6 +386,9 @@ def _parse_correct_answer(soup: BeautifulSoup, issues: list[str]) -> CorrectAnsw
         issues.append(f"could not read correct answer from {text[:120]!r}")
         return None
     letter = match.group(1).upper()
+    if letter == "X":
+        issues.append(ANNULLED_ISSUE)
+        return None
     if letter not in "ABCDE":
         issues.append(f"correct answer letter {letter} outside A-E")
         return None
@@ -394,6 +429,7 @@ def _parse_statistics(soup: BeautifulSoup, issues: list[str]) -> tuple[AnswerSta
     pairs = _statistics_pairs(_table_rows(table))
     values: dict[str, Decimal] = {}
     extra: dict[str, str] = {}
+    unpublished: list[str] = []
     for header, raw in pairs:
         norm = normalize_header(header)
         percent = PERCENT_HEADER_RE.match(norm)
@@ -404,9 +440,16 @@ def _parse_statistics(soup: BeautifulSoup, issues: list[str]) -> tuple[AnswerSta
         else:
             extra[header] = raw
             continue
-        if key in values:
+        if key in values or key in unpublished:
             raise MalformedQuestion(f"duplicate statistics column {header!r}")
+        if raw.strip() in NOT_PUBLISHED:
+            unpublished.append(key)
+            continue
         values[key] = _parse_decimal(raw)
+    extra = {k: v for k, v in extra.items() if v.strip() not in NOT_PUBLISHED}
+    if unpublished:  # e.g. an annulled question: the table is there, the numbers are "-"
+        issues.append(f"statistics not published by CEM ('-' for {', '.join(unpublished)})")
+        return None, extra or None
     missing = [key for key in ("A", "B", "C", "D", "E", "difficulty_index") if key not in values]
     if missing:
         raise MalformedQuestion(f"statistics table lacks required columns {missing}")

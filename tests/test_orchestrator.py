@@ -454,3 +454,50 @@ async def test_parallel_sessions_share_one_rate_limit(fast: Settings) -> None:
     assert first.client.traffic is second.client.traffic is manager.traffic
     await manager.release(first)
     await manager.release(second)
+
+
+async def test_reparse_fixes_content_failures_from_snapshots(fast: Settings, tmp_path) -> None:
+    """A parser fix applied to saved pages: no network, no CAPTCHA."""
+    broken = {3: question_page(number=3, stats_rows=[["Kolumna"], ["?"]])}  # unparseable statistics
+
+    def respond(session: str, number: int, _: ScriptedProvider) -> str:
+        return broken.get(number) or default_responder(4)(session, number, _)
+
+    provider = ScriptedProvider(respond)
+    orchestrator, repo = build(fast, provider)
+    await orchestrator.run(["20031"])
+    state = await repo.ensure_session(ExamSession.from_code("20031"))
+    assert (await repo.attempt_statuses(state.id))[3] is AttemptStatus.PARSE_ERROR
+    assert state.collection_status is CollectionStatus.FAILED
+
+    # Saved snapshots (the "fixed" page stands in for a parser that now understands it).
+    (tmp_path / "20031_3.html").write_text(question_page(number=3), encoding="utf-8")
+    (tmp_path / "20031_2.html").write_text(question_page(number=2, question="Nowa treść?"), encoding="utf-8")
+    provider.requested.clear()
+
+    report = await build(fast, provider, repo)[0].reparse(["20031", "20262"], tmp_path)
+    assert provider.requested == []  # nothing fetched
+    assert [s.session_code for s in report.sessions] == ["20031"]  # 20262 was never collected
+    assert report.sessions[0].outcome is SessionOutcome.COMPLETED
+    state = await repo.ensure_session(ExamSession.from_code("20031"))
+    assert state.collection_status is CollectionStatus.COMPLETED and state.discovered_question_count == 4
+    texts = {r["question_number"]: r["question_data"]["text"] for r in await repo.fetch_records()}
+    assert texts[2] == "Treść pytania testowego?"  # default mode leaves stored questions alone
+
+    await build(fast, provider, repo)[0].reparse(["20031"], tmp_path, everything=True)
+    texts = {r["question_number"]: r["question_data"]["text"] for r in await repo.fetch_records()}
+    assert texts[2] == "Nowa treść?"
+
+
+async def test_reparse_skips_non_question_snapshots(fast: Settings, tmp_path) -> None:
+    pages = {2: "<html><body>Błąd</body></html>"}
+
+    def respond(session: str, number: int, _: ScriptedProvider) -> str:
+        return pages.get(number) or default_responder(3)(session, number, _)
+
+    orchestrator, repo = build(fast, ScriptedProvider(respond))
+    await orchestrator.run(["20031"])
+    (tmp_path / "20031_2.html").write_text(ENTRY_FORM, encoding="utf-8")
+    await build(fast, ScriptedProvider(respond), repo)[0].reparse(["20031"], tmp_path)
+    state = await repo.ensure_session(ExamSession.from_code("20031"))
+    assert (await repo.attempt_statuses(state.id))[2] is AttemptStatus.UNEXPECTED_CONTENT  # untouched

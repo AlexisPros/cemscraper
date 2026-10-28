@@ -235,6 +235,7 @@ cem-scraper export --format jsonl --include-validation
 cem-scraper validate                            # re-validate stored records
 cem-scraper parse page.html --session 20031 --number 1   # offline parse
 cem-scraper verify-sessions --html form.html    # check YYYY1/YYYY2 codes against the form
+cem-scraper reparse                                # re-process saved snapshots (CEM_SAVE_HTML_DIR) offline
 ```
 
 Exit codes: `0` completed, `1` error, `2` blocked (access), `3` partial (some
@@ -319,11 +320,14 @@ There are 124 tests: parser, models, HTTP client, 2Captcha client, full automati
 ## Limitations and open questions
 
 1. **The automated mode has only been tested against mocks.** The CEM side of the HTTP flow (cookies across EULA → form → submission, extra form fields, plain non-JS submission) mirrors the documented browser observations but hasn't been exercised live. If CEM rejects it, the run stops with `blocked` after one CAPTCHA (`reportIncorrect` asks for a refund), and the interactive mode still works. Other solvers (CapSolver, Anti-Captcha) use the same `createTask`/`getTaskResult` protocol and can be added in `captcha.py`.
-2. **Not yet verified against live pages.** No authentic HTML was available, so these assumptions need a check against a few saved real pages (`CEM_SAVE_HTML_DIR`):
-   - the wording of the `<center>` line that question-number verification relies on (`QUESTION_NUMBER_PATTERNS`); if it differs, questions are stored as `needs_review` ("number could not be verified"), not rejected
-   - what CEM returns for numbers past the end of a session
-   - whether the session cookie works outside the browser; if it doesn't, set `CEM_BROWSER_CONTEXT_REQUESTS=true`
-   - session codes other than 20031 and 20262; run `verify-sessions`
+2. **Verified on the live site** (interactive run, Spring 2003, 2026-10-28):
+   - The entry is `eula_pes.php` → `form_pytania_pes.php` → `wyswietl_pytania_pes.php`. Opening the form directly leads to the *general* form (`eula.php` / `form_pytania.php`, a shorter session list), so the tool always starts at `eula_pes.php` and follows whichever question URL the site uses.
+   - The PES form offers 38 sessions (wiosna 2003 … jesień 2026). All 23 targets and specialization 725 are confirmed (`verify-sessions`).
+   - The header `Pytanie nr N - PES Psychiatria w sesji wiosna 2003` verifies both the question number and the session.
+   - Numbers past the end (121+) return the EULA page. The tool recognizes them as missing by re-checking a known question.
+   - Annulled questions show answer `X` and `-` statistics. They are stored as `needs_review` instead of failing.
+   - The session cookie works outside the browser. Question pages take a steady ~11 s; the adaptive limit rose to 4, giving about 6 minutes per 120-question session.
+   - Saved snapshots can be reprocessed offline after a parser fix with `cem-scraper reparse`.
 3. **Throttling.** The roughly 9–11 s responses seen in DevTools are unexplained. The tool doesn't try to get around them. It runs at low concurrency and stops when the server asks it to back off.
 4. Each session needs its own CAPTCHA, and re-entering an expired session costs another one. Expect about 23 manual solves for a full run.
 

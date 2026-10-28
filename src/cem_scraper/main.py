@@ -27,7 +27,12 @@ from cem_scraper.models import (
 )
 from cem_scraper.orchestrator import Orchestrator, RunReport
 from cem_scraper.parser import ParseError, decode_html, parse_entry_form, parse_question_page
-from cem_scraper.session_manager import AccessBlocked, SessionManager, build_access_provider
+from cem_scraper.session_manager import (
+    AccessBlocked,
+    FixtureAccessProvider,
+    SessionManager,
+    build_access_provider,
+)
 
 log = logging.getLogger("cem_scraper")
 
@@ -136,6 +141,25 @@ def _print_report(report: RunReport) -> None:
         f"retries={m['retries']} avg={secs('duration_avg_s')} median={secs('duration_median_s')} "
         f"p95={secs('duration_p95_s')} q/min={m['questions_per_minute']} total={m['total_duration_s']}s"
     )
+
+
+async def cmd_reparse(args: argparse.Namespace) -> int:
+    settings = _settings(args)
+    directory = args.dir or settings.save_html_dir
+    if directory is None or not directory.is_dir():
+        print("error: no snapshot directory (set CEM_SAVE_HTML_DIR or pass --dir)", file=sys.stderr)
+        return EXIT_ERROR
+    repo = await _postgres(settings)
+    metrics = Metrics()
+    # Reparsing never contacts CEM: the offline provider only completes the orchestrator's wiring.
+    manager = SessionManager(settings, FixtureAccessProvider(directory), metrics)
+    try:
+        codes = args.session or settings.target_sessions
+        report = await Orchestrator(settings, repo, manager, metrics).reparse(codes, directory, everything=args.all)
+    finally:
+        await repo.close()
+    _print_report(report)
+    return EXIT_OK if report.status is RunStatus.COMPLETED else EXIT_PARTIAL
 
 
 async def cmd_status(args: argparse.Namespace) -> int:
@@ -306,6 +330,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("status", help="per-session progress and recent runs")
 
+    reparse = sub.add_parser("reparse", help="re-process saved HTML snapshots offline (no CAPTCHA, no network)")
+    reparse.add_argument("--session", action="append")
+    reparse.add_argument("--dir", type=Path, help="snapshot directory (default: CEM_SAVE_HTML_DIR)")
+    reparse.add_argument("--all", action="store_true", help="reparse every question, not only content failures")
+
     export = sub.add_parser("export", help="export stored questions")
     export.add_argument("--format", choices=["json", "jsonl"], default="jsonl")
     export.add_argument("--session", action="append")
@@ -336,6 +365,7 @@ def main(argv: list[str] | None = None) -> int:
         "init-db": cmd_init_db,
         "scrape": cmd_scrape,
         "status": cmd_status,
+        "reparse": cmd_reparse,
         "export": cmd_export,
         "validate": cmd_validate,
         "verify-sessions": cmd_verify_sessions,

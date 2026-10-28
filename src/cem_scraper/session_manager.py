@@ -17,18 +17,19 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlsplit
 
 import httpx
 
 from cem_scraper.captcha import CaptchaProvider, CaptchaUnavailable
-from cem_scraper.client import CemClient, ClientError
+from cem_scraper.client import CemClient, ClientError, sanitize_snapshot
 from cem_scraper.config import (
     EULA_PATH,
     EXAM_TYPE,
@@ -39,10 +40,49 @@ from cem_scraper.config import (
 )
 from cem_scraper.metrics import Metrics
 from cem_scraper.models import ExamSession
-from cem_scraper.parser import PageKind, classify_page, make_soup, parse_entry_form
+from cem_scraper.parser import (
+    PageKind,
+    classify_page,
+    detect_session_code,
+    make_soup,
+    parse_entry_form,
+)
 from cem_scraper.throttle import TrafficControl
 
 log = logging.getLogger(__name__)
+
+
+QUESTION_URL_RE = re.compile(r".*/wyswietl_pytania\w*\.php.*")
+
+
+def describe_form(settings: Settings, html: str, session: ExamSession) -> None:
+    """Log which sessions the official form offers; save it when snapshots are enabled."""
+    if settings.save_html_dir:
+        settings.save_html_dir.mkdir(parents=True, exist_ok=True)
+        path = settings.save_html_dir / f"form_{session.session_code}.html"
+        path.write_text(sanitize_snapshot(html), encoding="utf-8")
+    options = parse_entry_form(html).session_options
+    if not options:
+        log.info("the session form has no static session list (it may load dynamically)")
+        return
+    codes = sorted(options)
+    log.info("the form offers %d sessions: %s ... %s", len(codes), ", ".join(codes[:3]), ", ".join(codes[-3:]))
+    if session.session_code not in options:
+        log.warning("session %s is NOT offered by this form", session.label)
+
+
+def verify_shown_session(html: str, session: ExamSession) -> None:
+    """The question page must belong to the requested session (header or hidden field)."""
+    soup = make_soup(html)
+    shown = detect_session_code(soup)
+    hidden = soup.select_one("input[name=sesja]")
+    if shown is None and hidden is not None:
+        shown = str(hidden.get("value") or "") or None
+    if shown is not None and shown != session.session_code:
+        raise AccessBlocked(
+            f"the page shows exam session {shown}, expected {session.session_code} ({session.label}); "
+            "choose the right session in the form"
+        )
 
 
 class AccessBlocked(Exception):
@@ -60,6 +100,8 @@ class AccessGrant:
     obtained_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     first_page_html: str | None = field(default=None, repr=False)
     transport: httpx.AsyncBaseTransport | None = field(default=None, repr=False)
+    # Absolute URL of the question page the site served after the form submission.
+    question_url: str | None = None
 
 
 class AccessProvider(ABC):
@@ -142,6 +184,7 @@ class HttpFormAccessProvider(AccessProvider):
         try:
             await client.get(EULA_PATH)
             form_page = await client.post(FORM_PATH, {"akceptacja": "tak"})
+            describe_form(self.settings, form_page.html, session)
             form = parse_entry_form(form_page.html)
             verify_form_supports(form.session_options, form.specialization_options, session)
             if not form.recaptcha_sitekey:
@@ -169,8 +212,11 @@ class HttpFormAccessProvider(AccessProvider):
             await self.captcha.report(solution, accepted=False)
         if kind is not PageKind.QUESTION:
             raise AccessBlocked(f"session entry for {session.label} was not accepted (got {kind.value} page)")
+        verify_shown_session(first.html, session)
         log.info("session %s entered automatically", session.label)
-        return AccessGrant(session_code=session.session_code, provider=self.name, first_page_html=first.html)
+        return AccessGrant(
+            session_code=session.session_code, provider=self.name, first_page_html=first.html, question_url=first.url
+        )
 
     async def close(self) -> None:
         await self.captcha.close()
@@ -266,15 +312,24 @@ class InteractiveBrowserAccessProvider(AccessProvider):
         page = await context.new_page()
         timeout_ms = self.settings.browser_wait_timeout * 1000
         try:
-            await page.goto(self.settings.url(FORM_PATH))
-            if await page.locator("input[name=akceptacja], button[name=akceptacja]").count():
+            # The PES entry point. Opening form_pytania_pes.php directly (without the PES
+            # EULA) sends the user to the general eula.php / form_pytania.php instead.
+            await page.goto(self.settings.url(EULA_PATH))
+            eula = page.locator("form:has(input[name=akceptacja])")
+            if await eula.count():
                 if self.settings.accept_eula:
-                    log.info("accepting EULA (CEM_ACCEPT_EULA=true)")
-                    await page.locator("input[name=akceptacja], button[name=akceptacja]").first.click()
+                    log.info("accepting the terms of use (CEM_ACCEPT_EULA=true)")
+                    box = eula.locator("input[name=akceptacja][type=checkbox]")  # live page: a checkbox
+                    if await box.count():
+                        await box.check()
+                    await eula.locator("[type=submit]").first.click()
                 else:
-                    log.warning("Please read and accept the terms of use in the browser window.")
-                await page.wait_for_selector("select[name=sesja], .g-recaptcha", timeout=timeout_ms)
-
+                    log.warning(
+                        "ACTION REQUIRED: read the terms of use in the browser window, tick the box "
+                        "and click 'Wyświetl pytania'."
+                    )
+            await page.wait_for_selector("select[name=sesja], .g-recaptcha", timeout=timeout_ms)
+            describe_form(self.settings, await page.content(), session)
             await self._prefill(page, session)
             log.warning(
                 "ACTION REQUIRED: in the browser window, check %s / Psychiatria / question 1, "
@@ -282,9 +337,10 @@ class InteractiveBrowserAccessProvider(AccessProvider):
                 session.label,
                 self.settings.browser_wait_timeout,
             )
-            await page.wait_for_url(f"**/{QUESTION_PATH}*", timeout=timeout_ms)
+            await page.wait_for_url(QUESTION_URL_RE, timeout=timeout_ms)
             await page.wait_for_load_state("domcontentloaded")
             html = await page.content()
+            question_url = page.url
         except AccessBlocked:
             raise
         except Exception as exc:  # Playwright timeouts, closed window, navigation errors
@@ -292,24 +348,28 @@ class InteractiveBrowserAccessProvider(AccessProvider):
         finally:
             await page.close()
 
-        soup = make_soup(html)
-        if classify_page(soup) is not PageKind.QUESTION:
+        if classify_page(make_soup(html)) is not PageKind.QUESTION:
             raise AccessBlocked("browser did not reach a question page after the form submission")
-        chosen = soup.select_one("input[name=sesja]")
-        if chosen is not None and chosen.get("value") not in (None, "", session.session_code):
-            raise AccessBlocked(
-                f"the browser session shows exam session {chosen.get('value')}, expected {session.session_code}"
-            )
+        verify_shown_session(html, session)
 
         transport = None
         if self.use_context_requests:
             transport = PlaywrightRequestTransport(context, self.settings.read_timeout * 1000)
         else:
-            for cookie in await context.cookies(self.settings.base_url):
-                client.cookies.set(cookie["name"], cookie["value"], domain=cookie["domain"], path=cookie["path"])
+            # Hosts this session talks to: the configured site and wherever the form landed
+            # (www.cem.edu.pl vs cem.edu.pl). Third-party cookies (e.g. Google's) are not copied.
+            hosts = {h for h in (urlsplit(self.settings.base_url).hostname, urlsplit(question_url).hostname) if h}
+            for cookie in await context.cookies():
+                domain = cookie["domain"].lstrip(".")
+                if any(host == domain or host.endswith("." + domain) for host in hosts):
+                    client.cookies.set(cookie["name"], cookie["value"], domain=cookie["domain"], path=cookie["path"])
         log.info("session %s authorized interactively", session.label)
         return AccessGrant(
-            session_code=session.session_code, provider=self.name, first_page_html=html, transport=transport
+            session_code=session.session_code,
+            provider=self.name,
+            first_page_html=html,
+            transport=transport,
+            question_url=question_url,
         )
 
     async def _prefill(self, page: Any, session: ExamSession) -> None:
@@ -406,6 +466,9 @@ class SessionManager:
         if grant.transport is not None:
             await client.aclose()
             client = self._new_client(grant.transport)
+        if grant.question_url:
+            client.question_url = grant.question_url
+            log.info("questions for %s are requested from %s", session.label, grant.question_url)
         return AuthorizedSession(session=session, client=client, grant=grant)
 
     async def reauthorize(self, auth: AuthorizedSession) -> AuthorizedSession:

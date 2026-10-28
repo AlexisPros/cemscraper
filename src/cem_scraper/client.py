@@ -121,6 +121,9 @@ class CemClient:
         self.settings = settings
         self.metrics = metrics
         self.traffic = traffic or TrafficControl(settings, metrics, sleep=sleep)
+        # Replaced by the endpoint the site actually used for the authorized session
+        # (e.g. wyswietl_pytania.php vs wyswietl_pytania_pes.php, with or without www).
+        self.question_url: str = QUESTION_PATH
         self._sleep = sleep
         self._http = httpx.AsyncClient(
             base_url=settings.base_url,
@@ -238,7 +241,7 @@ class CemClient:
         }
 
     async def fetch_question(self, session: ExamSession, number: int) -> PageResponse:
-        page = await self.post(QUESTION_PATH, self.question_payload(session, number))
+        page = await self.post(self.question_url, self.question_payload(session, number))
         if self.settings.save_html_dir:
             save_snapshot(self.settings.save_html_dir, session.session_code, number, page.html)
         return page

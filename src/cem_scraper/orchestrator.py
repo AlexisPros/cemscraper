@@ -26,6 +26,7 @@ import logging
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from enum import StrEnum
+from pathlib import Path
 
 from cem_scraper.client import (
     AccessDenied,
@@ -42,8 +43,12 @@ from cem_scraper.parser import (
     AuthorizationPageError,
     MalformedQuestion,
     NoQuestionContent,
+    PageKind,
     QuestionNumberMismatch,
     UnexpectedContent,
+    classify_page,
+    decode_html,
+    make_soup,
     parse_question_page,
 )
 from cem_scraper.session_manager import AccessBlocked, AuthorizedSession, OpenCancelled, SessionManager
@@ -283,8 +288,14 @@ class Orchestrator:
         finally:
             await self.sessions.release(auth)
 
-        all_statuses = await self.repo.attempt_statuses(state.id)
-        if only_failed:
+        return await self._finalize(state.id, session, report, highest, refine=only_failed)
+
+    async def _finalize(
+        self, session_id: int, session: ExamSession, report: SessionReport, highest: int, *, refine: bool
+    ) -> SessionReport:
+        """Derive the session's collection status from the persisted per-question statuses."""
+        all_statuses = await self.repo.attempt_statuses(session_id)
+        if refine:  # partial pass (retry/reparse): the questions seen so far define the range
             highest = max([highest, *(n for n, s in all_statuses.items() if s in EXISTING_STATUSES)], default=0)
         report.stored = sum(s is AttemptStatus.STORED for s in all_statuses.values())
         report.missing = sorted(n for n, s in all_statuses.items() if s is AttemptStatus.MISSING and n < highest)
@@ -295,18 +306,65 @@ class Orchestrator:
             log.warning("%s: %s", session.label, message)
             report.outcome, report.error = SessionOutcome.INCOMPLETE, message
             await self.repo.set_session_status(
-                state.id, CollectionStatus.FAILED, discovered_question_count=0, last_error=message
+                session_id, CollectionStatus.FAILED, discovered_question_count=0, last_error=message
             )
         elif failed:
             report.outcome = SessionOutcome.INCOMPLETE
             report.failed |= {n: report.failed.get(n, all_statuses[n].value) for n in failed}
             message = f"{len(failed)} question(s) failed: {failed[:20]}; rerun to retry"
             await self.repo.set_session_status(
-                state.id, CollectionStatus.FAILED, discovered_question_count=highest, last_error=message
+                session_id, CollectionStatus.FAILED, discovered_question_count=highest, last_error=message
             )
         else:
-            await self.repo.set_session_status(state.id, CollectionStatus.COMPLETED, discovered_question_count=highest)
+            await self.repo.set_session_status(
+                session_id, CollectionStatus.COMPLETED, discovered_question_count=highest
+            )
         return report
+
+    # ------------------------------------------------------------------ offline reprocessing
+
+    async def reparse(self, session_codes: list[str], directory: Path, *, everything: bool = False) -> RunReport:
+        """Re-process saved HTML snapshots (``CEM_SAVE_HTML_DIR``) without contacting CEM.
+
+        By default only questions that failed on their *content* (parse error, number
+        mismatch, unexpected content) are reprocessed, e.g. after a parser fix. With
+        ``everything`` every question that had content is parsed again. Network
+        failures (auth/server errors) need ``scrape --retry-failed``.
+        """
+        run_id = await self.repo.start_run(session_codes, "snapshots")
+        reports: list[SessionReport] = []
+        status = RunStatus.FAILED
+        content_failures = EXISTING_STATUSES - {AttemptStatus.STORED}
+        try:
+            for code in session_codes:
+                session = ExamSession.from_code(code, self.settings.specialization_code)
+                state = await self.repo.ensure_session(session)
+                statuses = await self.repo.attempt_statuses(state.id)
+                if not statuses:
+                    continue  # never collected: nothing saved to reparse
+                wanted = EXISTING_STATUSES if everything else content_failures
+                numbers = sorted(n for n, s in statuses.items() if s in wanted)
+                report = SessionReport(session_code=code, outcome=SessionOutcome.COMPLETED)
+                for number in numbers:
+                    path = directory / f"{code}_{number}.html"
+                    if not path.exists():
+                        log.warning("%s q%d: no snapshot at %s", code, number, path)
+                        continue
+                    html = decode_html(path.read_bytes())
+                    if classify_page(make_soup(html)) is not PageKind.QUESTION:
+                        log.warning("%s q%d: snapshot is not a question page; skipped", code, number)
+                        continue
+                    self._note_result(report, await self._handle_html(session, state.id, run_id, number, html))
+                reports.append(
+                    await self._finalize(state.id, session, report, state.discovered_question_count or 0, refine=True)
+                )
+                log.info("%s: reparsed %d snapshot(s) -> %s", session.label, len(numbers), reports[-1].outcome.value)
+            status = self._run_status(reports)
+        finally:
+            self.metrics.stop()
+            snapshot = self.metrics.snapshot()
+            await asyncio.shield(self.repo.finish_run(run_id, status, snapshot))
+        return RunReport(run_id=str(run_id), status=status, sessions=reports, metrics=snapshot)
 
     # ------------------------------------------------------------------ question engine
 
@@ -387,7 +445,7 @@ class Orchestrator:
 
         # The page returned by the official form submission is question 1: use it, no extra request.
         if auth.grant.first_page_html and 1 not in done and discovery:
-            absorb(await self._handle_html(auth, session_id, run_id, 1, auth.grant.first_page_html))
+            absorb(await self._handle_html(auth.session, session_id, run_id, 1, auth.grant.first_page_html))
 
         try:
             while True:
@@ -445,21 +503,21 @@ class Orchestrator:
         except (RequestFailed, UnexpectedStatus) as exc:
             result = QuestionResult(number, AttemptStatus.SERVER_ERROR, str(exc))
             return await self._record(session_id, run_id, code, result)
-        return await self._handle_html(auth, session_id, run_id, number, page.html, page.url)
+        return await self._handle_html(auth.session, session_id, run_id, number, page.html, page.url)
 
     async def _handle_html(
         self,
-        auth: AuthorizedSession,
+        session: ExamSession,
         session_id: int,
         run_id: object,
         number: int,
         html: str,
         url: str | None = None,
     ) -> QuestionResult:
-        code = auth.session.session_code
+        code = session.session_code
         try:
             parsed = parse_question_page(html, expected_number=number)
-            question = parsed.to_scraped(auth.session, number, source_url=url)
+            question = parsed.to_scraped(session, number, source_url=url)
         except AuthorizationPageError as exc:
             result = QuestionResult(number, AttemptStatus.AUTH_ERROR, str(exc))
         except NoQuestionContent as exc:

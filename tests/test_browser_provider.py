@@ -12,6 +12,7 @@ import asyncio
 import threading
 from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import ClassVar
 from urllib.parse import parse_qs
 
 import pytest
@@ -19,16 +20,27 @@ import pytest
 from cem_scraper.config import Settings
 from cem_scraper.metrics import Metrics
 from cem_scraper.models import ExamSession
-from cem_scraper.session_manager import InteractiveBrowserAccessProvider, SessionManager
+from cem_scraper.session_manager import AccessBlocked, InteractiveBrowserAccessProvider, SessionManager
 from tests.conftest import EDGE, load, question_page
 
 playwright = pytest.importorskip("playwright.async_api")
 
-# The synthetic form without Google's script: nothing external is loaded.
-FORM = load(EDGE / "entry_form.html").replace('<script src="https://www.google.com/recaptcha/api.js"></script>', "")
+# The synthetic form without Google's script: nothing external is loaded. Like the real
+# general form it posts to wyswietl_pytania.php (no "_pes"): the tool must follow the site.
+FORM = (
+    load(EDGE / "entry_form.html")
+    .replace('<script src="https://www.google.com/recaptcha/api.js"></script>', "")
+    .replace('action="wyswietl_pytania_pes.php"', 'action="wyswietl_pytania.php"')
+)
+EULA = load(EDGE / "eula.html")  # posts akceptacja=tak to form_pytania_pes.php, like eula_pes.php
+SEASONS = {"1": "wiosna", "2": "jesień"}
 
 
 class StandIn(BaseHTTPRequestHandler):
+    """Mimics the observed site: eula_pes.php -> POST form_pytania_pes.php -> POST wyswietl_pytania.php."""
+
+    question_posts: ClassVar[list[str]] = []
+
     def log_message(self, *args: object) -> None:
         pass
 
@@ -43,16 +55,21 @@ class StandIn(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self) -> None:
-        self._send(FORM, cookie="PHPSESSID=standin; Path=/")
+        self._send(EULA, cookie="PHPSESSID=standin; Path=/")
 
     def do_POST(self) -> None:
         form = {k: v[0] for k, v in parse_qs(self.rfile.read(int(self.headers["Content-Length"])).decode()).items()}
-        if "PHPSESSID=standin" not in (self.headers.get("Cookie") or ""):
+        has_cookie = "PHPSESSID=standin" in (self.headers.get("Cookie") or "")
+        if self.path.endswith("form_pytania_pes.php"):
+            self._send(FORM if form.get("akceptacja") == "tak" and has_cookie else EULA)
+            return
+        StandIn.question_posts.append(self.path)
+        if not has_cookie:
             self._send(FORM)
             return
-        number = int(form.get("nr_pytania", "1"))
-        page = question_page(number=number, question=f"sesja {form.get('sesja')} pytanie {number}?")
-        self._send(page.replace("</body>", f'<input type="hidden" name="sesja" value="{form.get("sesja")}"></body>'))
+        number, code = int(form.get("nr_pytania", "1")), form.get("sesja", "")
+        header = f"Pytanie nr {number} - PES Psychiatria w sesji {SEASONS[code[-1]]} {code[:4]}"
+        self._send(question_page(number=number, center=header, question=f"sesja {code} pytanie {number}?"))
 
 
 @pytest.fixture
@@ -64,7 +81,7 @@ def standin_url() -> Iterator[str]:
     server.shutdown()
 
 
-async def play_human(provider: InteractiveBrowserAccessProvider) -> None:
+async def play_human(provider: InteractiveBrowserAccessProvider, choose: str = "20031") -> None:
     """Wait for the pre-filled form, check it, and submit it as the user would."""
     for _ in range(200):
         if provider._context is not None and provider._context.pages:
@@ -73,24 +90,32 @@ async def play_human(provider: InteractiveBrowserAccessProvider) -> None:
                 await asyncio.sleep(0.3)  # let pre-fill finish
                 assert await page.locator("select[name=sesja]").input_value() == "20031"
                 assert await page.locator("select[name=specjalizacja]").input_value() == "725"
+                if choose != "20031":  # the user picks another session by mistake
+                    await page.locator("select[name=sesja]").select_option(choose)
                 await page.evaluate("document.forms[0].submit()")
                 return
         await asyncio.sleep(0.05)
     raise AssertionError("form never appeared")
 
 
-@pytest.mark.parametrize("context_requests", [False, True])
-async def test_interactive_flow_hands_session_to_httpx(
-    settings: Settings, standin_url: str, context_requests: bool
-) -> None:
-    s = settings.model_copy(
+def standin_settings(settings: Settings, standin_url: str) -> Settings:
+    return settings.model_copy(
         update={
             "base_url": standin_url,
             "browser_headless": True,
             "browser_wait_timeout": 20,
             "requests_per_second": 1000,
+            "accept_eula": True,
         }
     )
+
+
+@pytest.mark.parametrize("context_requests", [False, True])
+async def test_interactive_flow_hands_session_to_httpx(
+    settings: Settings, standin_url: str, context_requests: bool
+) -> None:
+    s = standin_settings(settings, standin_url)
+    StandIn.question_posts.clear()
     provider = InteractiveBrowserAccessProvider(s, use_context_requests=context_requests)
     manager = SessionManager(s, provider, Metrics())
     try:
@@ -103,6 +128,20 @@ async def test_interactive_flow_hands_session_to_httpx(
         assert auth.grant.first_page_html and "sesja 20031 pytanie 1?" in auth.grant.first_page_html
         page = await auth.client.fetch_question(auth.session, 7)
         assert "sesja 20031 pytanie 7?" in page.html  # the authorized session works outside the browser tab
+        # Navigation follows the endpoint the site used, not the hard-coded _pes one.
+        assert auth.client.question_url.endswith("/pytcem/wyswietl_pytania.php")
+        assert StandIn.question_posts == ["/pytcem/wyswietl_pytania.php"] * 2
         await manager.release(auth)
+    finally:
+        await manager.close()
+
+
+async def test_wrong_session_chosen_in_browser_is_rejected(settings: Settings, standin_url: str) -> None:
+    s = standin_settings(settings, standin_url)
+    provider = InteractiveBrowserAccessProvider(s)
+    manager = SessionManager(s, provider, Metrics())
+    try:
+        with pytest.raises(AccessBlocked, match="shows exam session 20262, expected 20031"):
+            await asyncio.gather(manager.open(ExamSession.from_code("20031")), play_human(provider, "20262"))
     finally:
         await manager.close()

@@ -17,6 +17,7 @@ from cem_scraper.parser import (
     UnexpectedContent,
     classify_page,
     decode_html,
+    detect_session_code,
     make_soup,
     parse_entry_form,
     parse_question_page,
@@ -355,3 +356,57 @@ def test_entry_form_parsing_never_returns_token() -> None:
     assert form.fields["krok"] == "2"
     assert form.fields["sesja"] == "20262"
     assert "g-recaptcha-response" not in form.fields
+
+
+def test_real_header_format_outside_center() -> None:
+    """Header as seen on cem.edu.pl, here rendered without a <center> element."""
+    header = "Pytanie nr <b>17</b> - PES <b>Psychiatria</b> w sesji <b>wiosna 2003</b>"
+    html = question_page(center="").replace("<p>Nagłówek</p>", f"<p>Nagłówek</p><div>{header}</div>")
+    parsed = parse_question_page(html, expected_number=17)
+    assert parsed.detected_number == 17 and parsed.issues == []
+    assert parse_question_page(question_page(center=f"{header}"), expected_number=17).detected_number == 17
+
+
+@pytest.mark.parametrize(
+    ("header", "code"),
+    [
+        ("Pytanie nr 1 - PES Psychiatria w sesji wiosna 2003", "20031"),
+        ("Pytanie nr 1 - PES Psychiatria w sesji jesień 2026", "20262"),
+        ("Pytanie nr 1 - PES Psychiatria w sesji JESIEN 2013", "20132"),
+        ("Pytanie nr 1", None),
+    ],
+)
+def test_detect_session_code(header: str, code: str | None) -> None:
+    assert detect_session_code(question_page(center=header)) == code
+
+
+LIVE_HEADERS = [
+    "Procent odp. A", "Procent odp. B", "Procent odp. C", "Procent odp. D", "Procent odp. E",
+    "Wskaźnik trudności", "M.D.*", "RPBI** A", "RPBI B", "RPBI C", "RPBI D", "RPBI E",
+]  # fmt: skip
+
+
+def test_annulled_question_is_kept_for_review() -> None:
+    """Structure seen live (Spring 2003 q48): answer "X", every statistic "-"."""
+    html = question_page(answer="Prawidłowa odpowiedź to: X", stats_rows=[LIVE_HEADERS, ["-"] * 12])
+    question = parse_question_page(html).to_scraped(ExamSession.from_code("20031"), 48)
+    assert question.correct_answer is None and question.answer_statistics is None
+    assert question.extra_statistics is None  # dashes are not data
+    assert "question annulled by CEM (correct answer marked X)" in question.validation_issues
+    assert any("statistics not published by CEM" in i for i in question.validation_issues)
+    assert question.validation_status is ValidationStatus.NEEDS_REVIEW
+
+
+def test_live_extra_headers_with_asterisks() -> None:
+    values = ["84.2", "8.8", "1.8", "3.5", "1.8", "0.900", "0.200", "0.107", "-0.088", "0.042", "0.033", "-0.196"]
+    parsed = parse_question_page(question_page(stats_rows=[LIVE_HEADERS, values]))
+    assert parsed.answer_statistics is not None and parsed.answer_statistics.difficulty_index == Decimal("0.900")
+    assert parsed.extra_statistics == dict(zip(LIVE_HEADERS[6:], values[6:], strict=True))
+
+
+def test_comments_block_is_ignored() -> None:
+    html = question_page().replace(
+        '<div id="odpowiedz1"',
+        '<div id="uwagi1" style="display: none;"><p><b>A.</b> komentarz</p></div><div id="odpowiedz1"',
+    )
+    assert parse_question_page(html).question_data.options["A"] == "opcja a"

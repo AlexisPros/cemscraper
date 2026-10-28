@@ -1,6 +1,8 @@
-<!-- SYNTHETIC FIXTURE: imitates the documented EULA page. -->
+<!-- SYNTHETIC FIXTURE: imitates the EULA page; the form markup (checkbox "akceptacja" + submit
+     "Wyświetl pytania", posting to form_pytania_pes.php) matches the live eula_pes.php as observed. -->
 <html><head><meta charset="utf-8"></head><body>
 <p>Regulamin korzystania z bazy pytań (tekst syntetyczny).</p>
 <form method="post" action="form_pytania_pes.php">
-  <input type="hidden" name="akceptacja" value="tak"><input type="submit" value="Akceptuję">
+  <input type="checkbox" name="akceptacja" value="tak"> Akceptuję zasady korzystania z bazy pytań
+  <input type="submit" value="Wyświetl pytania">
 </form></body></html>
