@@ -12,7 +12,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from cem_scraper.captcha import build_captcha_provider
+from cem_scraper.captcha import CaptchaUnavailable, build_captcha_provider
 from cem_scraper.config import EULA_PATH, FORM_PATH, AccessProviderName, Settings
 from cem_scraper.database import DatabaseUnavailable, InMemoryRepository, PostgresRepository, Repository
 from cem_scraper.exporter import export_records
@@ -80,7 +80,7 @@ async def cmd_scrape(args: argparse.Namespace) -> int:
     repo: Repository = InMemoryRepository() if use_memory else await _postgres(settings)
     metrics = Metrics()
     try:
-        provider = build_access_provider(settings, build_captcha_provider(settings))
+        provider = build_access_provider(settings, build_captcha_provider(settings, metrics))
     except AccessBlocked as exc:
         log.error("%s", exc)
         await repo.close()
@@ -129,6 +129,8 @@ def _print_report(report: RunReport) -> None:
     def secs(key: str) -> str:
         return "-" if m[key] is None else f"{m[key]}s"
 
+    if m.get("captcha_solves"):
+        print(f"  captcha: {m['captcha_solves']} solved, cost {m['captcha_cost']:.4f} (2Captcha account currency)")
     print(
         f"  requests={m['requests']} ok={m['request_successes']} failed={m['request_failures']} "
         f"retries={m['retries']} avg={secs('duration_avg_s')} median={secs('duration_median_s')} "
@@ -260,6 +262,24 @@ async def cmd_verify_sessions(args: argparse.Namespace) -> int:
     return EXIT_OK if ok else EXIT_ERROR
 
 
+async def cmd_captcha_balance(args: argparse.Namespace) -> int:
+    settings = _settings(args)
+    captcha = build_captcha_provider(settings)
+    try:
+        balance = await captcha.balance()
+    except CaptchaUnavailable as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+    finally:
+        await captcha.close()
+    if balance is None:
+        print(f"provider '{captcha.name}' has no balance (set CEM_CAPTCHA_PROVIDER=2captcha)")
+        return EXIT_ERROR
+    estimate = settings.captcha_max_solves
+    print(f"{captcha.name} balance: {balance}  (run caps: {settings.captcha_max_spend} / {estimate} solves)")
+    return EXIT_OK
+
+
 # --------------------------------------------------------------------------- parser
 
 
@@ -301,6 +321,8 @@ def build_parser() -> argparse.ArgumentParser:
     parse.add_argument("--session", required=True)
     parse.add_argument("--number", type=int, required=True)
 
+    sub.add_parser("captcha-balance", help="show the CAPTCHA provider balance (free call)")
+
     verify = sub.add_parser("verify-sessions", help="check session codes against the official form")
     verify.add_argument("--html", help="saved form_pytania_pes.php page (offline)")
     return parser
@@ -317,6 +339,7 @@ def main(argv: list[str] | None = None) -> int:
         "export": cmd_export,
         "validate": cmd_validate,
         "verify-sessions": cmd_verify_sessions,
+        "captcha-balance": cmd_captcha_balance,
     }
     try:
         if args.command == "parse":

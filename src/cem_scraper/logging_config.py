@@ -13,6 +13,7 @@ _SECRET_PATTERNS = [
     re.compile(r"(PHPSESSID=)[^;&\s\"']+", re.IGNORECASE),
     re.compile(r"((?:cookie|set-cookie|authorization)[\"']?\s*[:=]\s*[\"']?)[^\n\"']+", re.IGNORECASE),
     re.compile(r"(postgres(?:ql)?://[^:/\s]+:)[^@\s]+(@)", re.IGNORECASE),
+    re.compile(r"([\"']?clientKey[\"']?\s*[:=]\s*[\"']?)[^\"'\s,}]+", re.IGNORECASE),
 ]
 
 

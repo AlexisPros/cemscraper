@@ -9,7 +9,7 @@ import httpx
 import pytest
 import respx
 
-from cem_scraper.captcha import CaptchaProvider, DisabledCaptchaProvider
+from cem_scraper.captcha import CaptchaProvider, CaptchaSolution, DisabledCaptchaProvider
 from cem_scraper.client import CemClient
 from cem_scraper.config import Settings
 from cem_scraper.metrics import Metrics
@@ -32,14 +32,18 @@ class FakeAuthorizedCaptcha(CaptchaProvider):
 
     def __init__(self) -> None:
         self.calls: list[tuple[str, str]] = []
+        self.reports: list[bool] = []
 
     @property
     def available(self) -> bool:
         return True
 
-    async def solve(self, *, site_key: str, page_url: str) -> str:
+    async def solve(self, *, site_key: str, page_url: str) -> CaptchaSolution:
         self.calls.append((site_key, page_url))
-        return "dummy-test-token"
+        return CaptchaSolution(token="dummy-test-token", task_id="1")
+
+    async def report(self, solution: CaptchaSolution, *, accepted: bool) -> None:
+        self.reports.append(accepted)
 
 
 def http_settings(settings: Settings, **kw: object) -> Settings:
@@ -93,6 +97,7 @@ async def test_http_form_flow_with_authorized_provider(settings: Settings) -> No
     assert captcha.calls == [("SYNTHETIC-SITEKEY", BASE + "form_pytania_pes.php")]
     assert grant.first_page_html and "Huntingtona" in grant.first_page_html
     assert "dummy-test-token" not in repr(grant)
+    assert captcha.reports == [True]
 
 
 @respx.mock
@@ -116,10 +121,12 @@ async def test_http_form_detects_rejected_submission(settings: Settings) -> None
     respx.post(BASE + "wyswietl_pytania_pes.php").mock(
         return_value=httpx.Response(200, html=load(EDGE / "entry_form.html"))
     )
-    provider = HttpFormAccessProvider(http_settings(settings), FakeAuthorizedCaptcha())
+    captcha = FakeAuthorizedCaptcha()
+    provider = HttpFormAccessProvider(http_settings(settings), captcha)
     async with CemClient(settings, Metrics()) as client:
         with pytest.raises(AccessBlocked, match="was not accepted"):
             await provider.acquire(ExamSession.from_code("20031"), client)
+    assert captcha.reports == [False]  # rejected token reported for a refund
 
 
 class CountingProvider(AccessProvider):

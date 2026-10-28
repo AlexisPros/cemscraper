@@ -41,6 +41,7 @@ class AccessProviderName(StrEnum):
 
 class CaptchaProviderName(StrEnum):
     DISABLED = "disabled"
+    TWOCAPTCHA = "2captcha"
 
 
 class Settings(BaseSettings):
@@ -77,6 +78,13 @@ class Settings(BaseSettings):
     # Access management
     access_provider: AccessProviderName = AccessProviderName.INTERACTIVE_BROWSER
     captcha_provider: CaptchaProviderName = CaptchaProviderName.DISABLED
+    twocaptcha_api_key: SecretStr | None = None
+    twocaptcha_base_url: str = "https://api.2captcha.com"
+    # Per-run caps, in your 2Captcha account currency (USD). One CAPTCHA costs ~0.001-0.003.
+    captcha_max_spend: float = Field(default=1.0, gt=0, le=25)
+    captcha_max_solves: int = Field(default=40, ge=1)
+    captcha_timeout: float = Field(default=180.0, gt=0)
+    captcha_poll_interval: float = Field(default=5.0, ge=1)
     accept_eula: bool = False
     browser_wait_timeout: float = Field(default=600.0, gt=0)
     browser_profile_dir: Path | None = None

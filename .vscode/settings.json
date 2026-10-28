@@ -1,0 +1,6 @@
+{
+  // The project's uv-managed environment (created by `uv sync`).
+  "python.defaultInterpreterPath": "${workspaceFolder}/.venv/bin/python",
+  // Activate it automatically in every new integrated terminal (fish included).
+  "python.terminal.activateEnvironment": true
+}

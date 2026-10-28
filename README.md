@@ -5,15 +5,15 @@ Specjalizacyjny) **Psychiatria** questions from CEM
 (`https://www.cem.edu.pl/pytcem/`) for Spring 2003 – Autumn 2013 (22 sessions)
 plus Autumn 2026. Results go into PostgreSQL (JSONB columns), and you can export them to JSON or JSONL.
 
-> **Access status (blocking dependency).** Each examination session is entered
-> through CEM's official form, which requires Google reCAPTCHA v2. There's no
-> authorized automated mechanism (CEM permission, export or API) at the moment,
-> so **fully autonomous live scraping is not implemented as working and has not been demonstrated.** The
-> supported live mode is **semi-automated**: you solve one reCAPTCHA per session
-> (23 in total) in a browser window that the tool opens, and the tool does everything else.
-> The automated path (`http_form`) is fully built. It only proceeds once an
-> *authorized* `CaptchaProvider` is plugged in, and until then it stops
-> before contacting CEM.
+> **Access modes.** Each examination session is entered through CEM's official
+> form, which requires Google reCAPTCHA v2. There are two live modes:
+>
+> - **Interactive (default):** you solve one reCAPTCHA per session (23 in total) in a
+>   browser window that the tool opens, and the tool does everything else.
+> - **Fully automated (opt-in, paid):** `http_form` + 2Captcha. The tool goes from the EULA
+>   page to the last question with no human involved. It is tested end to end against
+>   mocked CEM and 2Captcha services, but **it has not yet been run against the live site**.
+>   Whether CEM's terms allow a solving service is your decision.
 
 ## How it works
 
@@ -56,6 +56,46 @@ This is a port of the JavaScript parser that was verified manually:
 5. `<br>` becomes `\n` and whitespace is normalized. A trailing `Prawidłowa odpowiedź to:` is removed. That phrase is **never** used as an anchor.
 6. The answer letter comes from the hidden `#odpowiedz1`. Statistics come from `#statystyki1 table`, matched by **normalized header names**, so extra columns (`M.D.`, `RPBI A–E`) don't matter. Those extra columns are kept separately in `questions.extra_statistics`.
 7. Images and tables inside a question are recorded as `attachments`, and the question is flagged `needs_review`. They are never dropped silently.
+
+### Fully automated mode (2Captcha)
+
+```bash
+# .env
+CEM_ACCESS_PROVIDER=http_form
+CEM_CAPTCHA_PROVIDER=2captcha
+CEM_TWOCAPTCHA_API_KEY=your-key       # from https://2captcha.com/enterpage; never logged
+CEM_ACCEPT_EULA=true                  # your explicit acceptance of CEM's terms
+CEM_CAPTCHA_MAX_SPEND=1.0             # per-run cap, account currency (USD)
+CEM_CAPTCHA_MAX_SOLVES=40             # per-run cap
+```
+
+```bash
+uv run cem-scraper captcha-balance    # free check of key and balance
+```
+
+```bash
+uv run cem-scraper scrape             # unattended from here
+```
+
+Per session the flow is:
+1. `GET eula_pes.php`, then `POST form_pytania_pes.php` with `akceptacja=tak`.
+2. Read the session form and its `data-sitekey`.
+3. 2Captcha `createTask` (`RecaptchaV2TaskProxyless`), then poll `getTaskResult` every 5 s.
+4. Submit the official form with the token. The response is question 1.
+5. Tell 2Captcha whether CEM accepted the token: `reportCorrect`, or `reportIncorrect` (refund).
+
+A token is used once and never stored or logged.
+
+With `CEM_PIPELINE_DEPTH=2`, the next session's CAPTCHA is solved while the current
+session is collected, so its 20–60 s solve time is hidden. Price: 4.49–13.49 PLN per
+1000 reCAPTCHA v2, so a full run (~23 sessions) costs well under 1 PLN.
+
+Safety rails:
+- the balance is checked once before the first task;
+- an empty balance, a wrong key or a blocked account stops the run, and nothing is ever topped up automatically;
+- unsolvable tasks are refunded by 2Captcha and retried up to 3 times;
+- when a per-run cap is reached, the run stops with `blocked`;
+- the run report and `scrape_runs.diagnostics` record `captcha_solves` and `captcha_cost`.
 
 ### Throughput: adaptive concurrency and the session pipeline
 
@@ -114,6 +154,8 @@ Requirements: Python 3.12+, [uv](https://docs.astral.sh/uv/), and Docker (for Po
 ```bash
 uv sync                                   # core + dev dependencies
 ```
+
+`uv sync` creates `.venv/` (not `venv/`). Use `uv run <command>` without activating it, or activate it in fish with `source .venv/bin/activate.fish`. In VS Code, `.vscode/settings.json` selects `.venv` and activates it in every *new* integrated terminal.
 
 ```bash
 cp .env.example .env                      # then edit
@@ -249,7 +291,7 @@ These are soft issues: the question is stored with `validation_status = needs_re
 uv run pytest
 ```
 
-There are 107 tests: parser, models, HTTP client, traffic control, access management, PostgreSQL, the orchestrator (including the session pipeline), and the browser provider. They need no network access, no CAPTCHA, and no paid services.
+There are 124 tests: parser, models, HTTP client, 2Captcha client, full automation from the EULA page (mocked), traffic control, access management, PostgreSQL, the orchestrator (including the session pipeline), and the browser provider. They need no network access, no CAPTCHA, and no paid services.
 
 - **PostgreSQL tests** start a throwaway embedded PostgreSQL 16 (`pgserver`). Alternatively, set `CEM_TEST_DATABASE_URL` to a **dedicated** database; its `public` schema gets wiped.
 - **Browser tests** run headless Chromium against a local stand-in server, not CEM. They're skipped if Playwright isn't installed.
@@ -257,7 +299,7 @@ There are 107 tests: parser, models, HTTP client, traffic control, access manage
 
 ## Limitations and open questions
 
-1. **Autonomous access is blocked** (see the top of this page). Removing the block takes CEM authorization or an official export/API. A permitted CAPTCHA integration can then implement `CaptchaProvider` (with `available = True`) and be registered in `build_captcha_provider`. No solving service is included, and none is called.
+1. **The automated mode has only been tested against mocks.** The CEM side of the HTTP flow (cookies across EULA → form → submission, extra form fields, plain non-JS submission) mirrors the documented browser observations but hasn't been exercised live. If CEM rejects it, the run stops with `blocked` after one CAPTCHA (`reportIncorrect` asks for a refund), and the interactive mode still works. Other solvers (CapSolver, Anti-Captcha) use the same `createTask`/`getTaskResult` protocol and can be added in `captcha.py`.
 2. **Not yet verified against live pages.** No authentic HTML was available, so these assumptions need a check against a few saved real pages (`CEM_SAVE_HTML_DIR`):
    - the wording of the `<center>` line that question-number verification relies on (`QUESTION_NUMBER_PATTERNS`); if it differs, questions are stored as `needs_review` ("number could not be verified"), not rejected
    - what CEM returns for numbers past the end of a session
@@ -271,4 +313,5 @@ There are 107 tests: parser, models, HTTP client, traffic control, access manage
 Accept the terms of use yourself (`CEM_ACCEPT_EULA` is off by default). Keep
 request rates low, and identify yourself with `CEM_CONTACT_EMAIL`. Content that is publicly
 viewable is not the same as permission to collect it in bulk; ask CEM if in doubt.
-The tool contains no CAPTCHA bypass, token replay, fingerprint evasion, or proxy rotation.
+CAPTCHA solving through 2Captcha is opt-in, capped, and your decision with respect
+to CEM's terms. The tool contains no token replay, fingerprint evasion, or proxy rotation.

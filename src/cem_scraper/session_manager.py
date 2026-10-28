@@ -114,11 +114,12 @@ class FixtureAccessProvider(AccessProvider):
 
 
 class HttpFormAccessProvider(AccessProvider):
-    """Official EULA + session-entry form over HTTP, with an *authorized* CaptchaProvider.
+    """Fully automated entry: EULA page -> acceptance -> session form -> CAPTCHA -> question 1.
 
-    This is the fully automated path. It only proceeds when the EULA acceptance
-    is explicitly configured and a CAPTCHA provider reports itself available.
-    With the default ``DisabledCaptchaProvider`` it stops before contacting CEM.
+    Proceeds only when EULA acceptance is explicitly configured
+    (``CEM_ACCEPT_EULA=true``) and a CAPTCHA provider is available (e.g. 2Captcha
+    with a key and budget); otherwise it stops before contacting CEM. The solver
+    is told whether CEM accepted the token (refund on rejection).
     """
 
     name = "http_form"
@@ -151,19 +152,28 @@ class HttpFormAccessProvider(AccessProvider):
                 "specjalizacja": session.specialization_code,
                 "nr_pytania": "1",
             }
-            fields["g-recaptcha-response"] = await self.captcha.solve(
-                site_key=form.recaptcha_sitekey, page_url=form_page.url
-            )
-            first = await client.post(form.action or QUESTION_PATH, fields)
-            fields.pop("g-recaptcha-response", None)  # single use, never kept
+            solution = await self.captcha.solve(site_key=form.recaptcha_sitekey, page_url=form_page.url)
+            fields["g-recaptcha-response"] = solution.token
+            try:
+                first = await client.post(form.action or QUESTION_PATH, fields)
+            finally:
+                fields.pop("g-recaptcha-response", None)  # single use, never kept
         except CaptchaUnavailable as exc:
             raise AccessBlocked(str(exc)) from exc
         except ClientError as exc:
             raise AccessBlocked(f"session entry failed: {exc}") from exc
         kind = classify_page(make_soup(first.html))
+        if kind is PageKind.QUESTION:
+            await self.captcha.report(solution, accepted=True)
+        elif kind is PageKind.ENTRY_FORM:  # the form came back: the token was rejected
+            await self.captcha.report(solution, accepted=False)
         if kind is not PageKind.QUESTION:
             raise AccessBlocked(f"session entry for {session.label} was not accepted (got {kind.value} page)")
+        log.info("session %s entered automatically", session.label)
         return AccessGrant(session_code=session.session_code, provider=self.name, first_page_html=first.html)
+
+    async def close(self) -> None:
+        await self.captcha.close()
 
 
 def verify_form_supports(session_options: dict[str, str], spec_options: dict[str, str], session: ExamSession) -> None:
