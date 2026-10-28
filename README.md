@@ -70,11 +70,11 @@ CEM_CAPTCHA_MAX_SOLVES=40             # per-run cap
 ```
 
 ```bash
-uv run cem-scraper captcha-balance    # free check of key and balance
+cem-scraper captcha-balance    # free check of key and balance
 ```
 
 ```bash
-uv run cem-scraper scrape             # unattended from here
+cem-scraper scrape             # unattended from here
 ```
 
 Per session the flow is:
@@ -149,13 +149,40 @@ Each question gets one persisted status:
 
 ## Setup
 
-Requirements: Python 3.12+, [uv](https://docs.astral.sh/uv/), and Docker (for PostgreSQL).
+Requirements: Python 3.12+ (3.12 recommended: the embedded PostgreSQL used by the
+tests has no builds for 3.13+), [uv](https://docs.astral.sh/uv/) (`brew install uv`)
+and Docker (for PostgreSQL).
+
+### Recommended: uv (exact versions from `uv.lock`)
 
 ```bash
-uv sync                                   # core + dev dependencies
+uv sync --extra browser                   # creates/updates .venv to match uv.lock exactly
 ```
 
-`uv sync` creates `.venv/` (not `venv/`). Use `uv run <command>` without activating it, or activate it in fish with `source .venv/bin/activate.fish`. In VS Code, `.vscode/settings.json` selects `.venv` and activates it in every *new* integrated terminal.
+```bash
+uv run playwright install chromium        # only for the interactive browser mode
+```
+
+Run commands with `uv run <command>` without activating anything, or activate the
+environment in fish with `source .venv/bin/activate.fish` (bash/zsh: `source .venv/bin/activate`).
+In VS Code, `.vscode/settings.json` selects `.venv` and activates it in every *new*
+integrated terminal. `uv sync` also removes packages that are no longer declared, and
+`uv sync --check` verifies the environment matches the lock.
+
+### Without uv: `python -m venv` + pip
+
+```bash
+python3.12 -m venv --prompt cem-scraper .venv && source .venv/bin/activate.fish
+```
+
+```bash
+python -m pip install --upgrade pip && pip install -e ".[browser]" --group dev
+```
+
+This produces the same kind of `.venv`, but pip ignores `uv.lock` and installs the newest
+versions `pyproject.toml` allows, so versions can drift from the tested ones.
+
+### Database and configuration
 
 ```bash
 cp .env.example .env                      # then edit
@@ -166,56 +193,48 @@ docker compose up -d                      # PostgreSQL 16 on localhost:5432
 ```
 
 ```bash
-uv run cem-scraper init-db                # apply migrations (idempotent)
+cem-scraper init-db                       # apply migrations (idempotent)
 ```
 
-For the live (interactive) mode, add the browser extra:
-
-```bash
-uv sync --extra browser
-```
-
-```bash
-uv run playwright install chromium
-```
+Commands below are written for an activated `.venv`; alternatively prefix them with `uv run`.
 
 ## Usage
 
 Try everything offline first. This run uses the synthetic fixtures, never touches the network, and stores results in memory:
 
 ```bash
-uv run cem-scraper scrape --dry-run --session 20031 --session 20262
+cem-scraper scrape --dry-run --session 20031 --session 20262
 ```
 
 Use the same fixtures but write to PostgreSQL:
 
 ```bash
-uv run cem-scraper scrape --dry-run --db --session 20031
+cem-scraper scrape --dry-run --db --session 20031
 ```
 
 Live collection, semi-automated. A browser window opens for each session: read and accept the terms, solve the reCAPTCHA, and submit. The tool then collects that session over HTTP.
 
 ```bash
-uv run cem-scraper scrape --session 20031
+cem-scraper scrape --session 20031
 ```
 
 Run all 23 sessions. The run resumes by default, and completed sessions are skipped.
 
 ```bash
-uv run cem-scraper scrape
+cem-scraper scrape
 ```
 
 Other commands:
 
 ```bash
-uv run cem-scraper scrape --retry-failed               # only reprocess failed questions
-uv run cem-scraper scrape --refetch --session 20262    # collect a session again
-uv run cem-scraper status                              # per-session progress + recent runs
-uv run cem-scraper export --format json                # output/pes_psychiatria.json
-uv run cem-scraper export --format jsonl --include-validation
-uv run cem-scraper validate                            # re-validate stored records
-uv run cem-scraper parse page.html --session 20031 --number 1   # offline parse
-uv run cem-scraper verify-sessions --html form.html    # check YYYY1/YYYY2 codes against the form
+cem-scraper scrape --retry-failed               # only reprocess failed questions
+cem-scraper scrape --refetch --session 20262    # collect a session again
+cem-scraper status                              # per-session progress + recent runs
+cem-scraper export --format json                # output/pes_psychiatria.json
+cem-scraper export --format jsonl --include-validation
+cem-scraper validate                            # re-validate stored records
+cem-scraper parse page.html --session 20031 --number 1   # offline parse
+cem-scraper verify-sessions --html form.html    # check YYYY1/YYYY2 codes against the form
 ```
 
 Exit codes: `0` completed, `1` error, `2` blocked (access), `3` partial (some
@@ -288,12 +307,12 @@ These are soft issues: the question is stored with `validation_status = needs_re
 ## Tests
 
 ```bash
-uv run pytest
+pytest
 ```
 
 There are 124 tests: parser, models, HTTP client, 2Captcha client, full automation from the EULA page (mocked), traffic control, access management, PostgreSQL, the orchestrator (including the session pipeline), and the browser provider. They need no network access, no CAPTCHA, and no paid services.
 
-- **PostgreSQL tests** start a throwaway embedded PostgreSQL 16 (`pgserver`). Alternatively, set `CEM_TEST_DATABASE_URL` to a **dedicated** database; its `public` schema gets wiped.
+- **PostgreSQL tests** start a throwaway embedded PostgreSQL 16 (`pgserver`, Python 3.12 only; on 3.13+ they are skipped unless `CEM_TEST_DATABASE_URL` is set). Alternatively, set `CEM_TEST_DATABASE_URL` to a **dedicated** database; its `public` schema gets wiped.
 - **Browser tests** run headless Chromium against a local stand-in server, not CEM. They're skipped if Playwright isn't installed.
 - **Fixtures** in `tests/fixtures/` are **synthetic** (see its README). The two reference questions (Spring 2003 Q1, Autumn 2026 Q1) reproduce the manually verified content, but the surrounding markup is invented.
 

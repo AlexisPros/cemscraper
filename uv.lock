@@ -126,7 +126,7 @@ browser = [
 [package.dev-dependencies]
 dev = [
     { name = "mypy" },
-    { name = "pgserver", marker = "sys_platform != 'win32'" },
+    { name = "pgserver", marker = "python_full_version < '3.13' and sys_platform != 'win32'" },
     { name = "pip" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
@@ -149,7 +149,7 @@ provides-extras = ["browser"]
 [package.metadata.requires-dev]
 dev = [
     { name = "mypy", specifier = ">=1.11" },
-    { name = "pgserver", marker = "sys_platform != 'win32'", specifier = ">=0.1.4" },
+    { name = "pgserver", marker = "python_full_version < '3.13' and sys_platform != 'win32'", specifier = ">=0.1.4" },
     { name = "pip", specifier = ">=24" },
     { name = "pytest", specifier = ">=8.2" },
     { name = "pytest-asyncio", specifier = ">=0.23" },
