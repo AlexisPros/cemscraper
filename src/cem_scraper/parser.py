@@ -528,17 +528,24 @@ def parse_entry_form(html: str) -> EntryForm:
             break
     scope: Tag = form or soup
     fields: dict[str, str] = {}
-    for element in scope.find_all(["input", "select", "textarea"]):
+    submit_button: tuple[str, str] | None = None
+    for element in scope.find_all(["input", "select", "textarea", "button"]):
         name = attr(element, "name")
         if not name or name == "g-recaptcha-response":
             continue
         if element.name == "select":
             selected = element.find("option", selected=True) or element.find("option")
             fields[name] = attr(selected, "value") if selected else ""
-        elif attr(element, "type").lower() in ("submit", "button", "image"):
+        elif element.name == "button" or attr(element, "type").lower() in ("submit", "button", "image"):
+            # A browser sends the clicked submit button's name=value (live form: submit=Pokaż pytanie).
+            if submit_button is None and attr(element, "type").lower() in ("submit", ""):
+                submit_button = (name, attr(element, "value"))
             continue
         else:
             fields[name] = attr(element, "value")
+
+    if submit_button is not None:
+        fields.setdefault(*submit_button)
 
     def options_of(name: str) -> dict[str, str]:
         select = scope.find("select", attrs={"name": name})

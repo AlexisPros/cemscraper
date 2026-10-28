@@ -31,8 +31,11 @@ def default_target_sessions() -> list[str]:
 
 
 class AccessProviderName(StrEnum):
-    # Human solves the reCAPTCHA in a real browser window; cookies are handed to HTTPX.
+    # Human solves the reCAPTCHA in a Playwright-controlled browser window; cookies go to HTTPX.
     INTERACTIVE_BROWSER = "interactive_browser"
+    # Human solves it in their own Google Chrome, which nothing controls during the check;
+    # the tool only reads the session cookie afterwards.
+    MANUAL_CHROME = "manual_chrome"
     # Fully automated form submission; needs an *authorized* CaptchaProvider.
     HTTP_FORM = "http_form"
     # Offline: serves local HTML fixtures, never touches the network.
@@ -83,11 +86,18 @@ class Settings(BaseSettings):
     # Per-run caps, in your 2Captcha account currency (USD). One CAPTCHA costs ~0.001-0.003.
     captcha_max_spend: float = Field(default=1.0, gt=0, le=25)
     captcha_max_solves: int = Field(default=40, ge=1)
+    # Lifetime cap over all runs recorded in the database (scrape_runs.diagnostics.captcha_cost).
+    # 25 USD is roughly the 100 PLN budget; the default stays far below it.
+    captcha_total_budget: float = Field(default=5.0, gt=0, le=25)
     captcha_timeout: float = Field(default=180.0, gt=0)
     captcha_poll_interval: float = Field(default=5.0, ge=1)
     accept_eula: bool = False
     browser_wait_timeout: float = Field(default=600.0, gt=0)
     browser_profile_dir: Path | None = None
+    # manual_chrome: the Google Chrome binary (auto-detected when empty) and its local DevTools port.
+    chrome_path: Path | None = None
+    chrome_debug_port: int = Field(default=9222, ge=1024, le=65535)
+    chrome_extra_args: Annotated[list[str], NoDecode] = Field(default_factory=list)
     # Headless is only useful for automated tests: a human must see the window to solve the CAPTCHA.
     browser_headless: bool = False
     max_reauthorizations_per_session: int = Field(default=1, ge=0)
@@ -104,7 +114,13 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     log_json: bool = False
 
-    @field_validator("target_sessions", mode="before")
+    @field_validator("chrome_path", "browser_profile_dir", "save_html_dir", mode="before")
+    @classmethod
+    def _empty_path_is_unset(cls, value: object) -> object:
+        # `CEM_CHROME_PATH=` in .env would otherwise become Path(".")
+        return None if isinstance(value, str) and not value.strip() else value
+
+    @field_validator("target_sessions", "chrome_extra_args", mode="before")
     @classmethod
     def _split_sessions(cls, value: object) -> object:
         if isinstance(value, str):

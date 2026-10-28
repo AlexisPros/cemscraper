@@ -114,3 +114,10 @@ def test_record_shape_has_three_independent_objects() -> None:
         "answer_statistics",
     ]
     assert record["question_data"] == {"text": "P?", "options": OPTIONS}
+
+
+def test_empty_path_settings_are_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in ("CEM_CHROME_PATH", "CEM_BROWSER_PROFILE_DIR", "CEM_SAVE_HTML_DIR"):
+        monkeypatch.setenv(name, "")
+    s = Settings(_env_file=None)  # type: ignore[call-arg]
+    assert (s.chrome_path, s.browser_profile_dir, s.save_html_dir) == (None, None, None)

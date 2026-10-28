@@ -8,8 +8,12 @@ plus Autumn 2026. Results go into PostgreSQL (JSONB columns), and you can export
 > **Access modes.** Each examination session is entered through CEM's official
 > form, which requires Google reCAPTCHA v2. There are two live modes:
 >
-> - **Interactive (default):** you solve one reCAPTCHA per session (23 in total) in a
->   browser window that the tool opens, and the tool does everything else.
+> - **Your own Chrome (`manual_chrome`, recommended):** you pass the terms and the reCAPTCHA
+>   in a regular Google Chrome window that nothing controls during the check. The tool then
+>   picks up the session cookie and does everything else. One check per session, usually quick.
+> - **Interactive (`interactive_browser`):** the same, but in a Playwright-controlled window.
+>   reCAPTCHA recognizes it as automated (`navigator.webdriver = true`) and often asks for many
+>   rounds of image challenges.
 > - **Fully automated (opt-in, paid):** `http_form` + 2Captcha. The tool goes from the EULA
 >   page to the last question with no human involved. It is tested end to end against
 >   mocked CEM and 2Captcha services, but **it has not yet been run against the live site**.
@@ -57,6 +61,26 @@ This is a port of the JavaScript parser that was verified manually:
 6. The answer letter comes from the hidden `#odpowiedz1`. Statistics come from `#statystyki1 table`, matched by **normalized header names**, so extra columns (`M.D.`, `RPBI A–E`) don't matter. Those extra columns are kept separately in `questions.extra_statistics`.
 7. Images and tables inside a question are recorded as `attachments`, and the question is flagged `needs_review`. They are never dropped silently.
 
+### Your own Chrome (`manual_chrome`)
+
+```bash
+# .env
+CEM_ACCESS_PROVIDER=manual_chrome
+CEM_BROWSER_PROFILE_DIR=browser_profile   # separate, persistent Chrome profile (git-ignored)
+```
+
+The tool starts Google Chrome as a normal browser, with that profile and a DevTools port that
+only accepts local connections (`CEM_CHROME_DEBUG_PORT`, default 9222), and opens
+`eula_pes.php` in a new tab. You accept the terms, choose the session, pass the reCAPTCHA and
+click «Pokaż pytanie».
+
+While you do this the tool doesn't attach to the page. It only polls the tab list. When the
+tab shows a question page, it reads the session cookie at browser level, checks the session
+over HTTP and continues the collection. Because the profile persists, Google's trust in it
+grows over time. Nothing is hidden or faked: the check simply happens in a browser a person is
+using. The Chrome instance the tool started is closed at the end of the run. Set
+`CEM_CHROME_PATH` if Chrome isn't in the standard location.
+
 ### Fully automated mode (2Captcha)
 
 ```bash
@@ -90,7 +114,13 @@ With `CEM_PIPELINE_DEPTH=2`, the next session's CAPTCHA is solved while the curr
 session is collected, so its 20–60 s solve time is hidden. Price: 4.49–13.49 PLN per
 1000 reCAPTCHA v2, so a full run (~23 sessions) costs well under 1 PLN.
 
-Safety rails:
+Safety rails, each pinned by a test in `tests/test_money_safety.py`:
+- **One task is never paid twice.** If `createTask` may have reached 2Captcha (read timeout, dropped connection, HTTP error), it is not resent. Only a request that never left the machine is retried. Polling and balance calls are free and may retry.
+- **A bought token is used exactly once.** The form submission carrying it is never retried, because the token is single-use.
+- **The token is bought fresh.** Every check that can fail is done first (EULA consent, session offered by the form, sitekey present), and any server `Retry-After` pause is waited out *before* buying, because a token is valid for about 2 minutes. The token's age at submission is logged.
+- **No CAPTCHA when a download can't help.** A rerun skips sessions whose only failures are parse errors, since the same HTML fails the same way (use `reparse`), and sessions where an earlier run found no questions (use `--refetch` to try them again).
+- **No re-authorization on a guess.** If the check of a known question fails on the network, the affected numbers are retried in a later run; a new CAPTCHA is bought only when the site really shows the entry form again.
+- **Two spending caps.** One per run (`CEM_CAPTCHA_MAX_SPEND`, `CEM_CAPTCHA_MAX_SOLVES`) and one lifetime cap over all runs recorded in the database (`CEM_CAPTCHA_TOTAL_BUDGET`, default 5 USD, at most 25 USD ≈ 100 PLN).
 - the balance is checked once before the first task;
 - an empty balance, a wrong key or a blocked account stops the run, and nothing is ever topped up automatically;
 - unsolvable tasks are refunded by 2Captcha and retried up to 3 times;
@@ -254,7 +284,7 @@ at 8 and the rate at 5 req/s.
 
 | Setting | Meaning |
 |---|---|
-| `CEM_ACCESS_PROVIDER` | `interactive_browser` (default), `http_form`, or `fixtures` |
+| `CEM_ACCESS_PROVIDER` | `manual_chrome` (recommended), `interactive_browser` (default), `http_form`, or `fixtures` |
 | `CEM_ADAPTIVE_CONCURRENCY` / `CEM_MAX_CONCURRENCY` | Turn the controller on or off (`false` keeps `CEM_CONCURRENCY` fixed) and set its upper bound |
 | `CEM_PIPELINE_DEPTH` | Sessions open at once; `1` means strictly sequential |
 | `CEM_ACCEPT_EULA` | `false` by default. The tool never accepts the terms on your behalf unless you set this |

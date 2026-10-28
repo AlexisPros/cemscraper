@@ -36,7 +36,7 @@ from cem_scraper.client import (
     UnexpectedStatus,
 )
 from cem_scraper.config import Settings
-from cem_scraper.database import Repository
+from cem_scraper.database import Repository, SessionState
 from cem_scraper.metrics import Metrics
 from cem_scraper.models import AttemptStatus, CollectionStatus, ExamSession, RunStatus
 from cem_scraper.parser import (
@@ -62,6 +62,17 @@ EXISTING_STATUSES = {
     AttemptStatus.NUMBER_MISMATCH,
     AttemptStatus.UNEXPECTED_CONTENT,
 }
+
+# The same HTML always fails the same way: downloading it again (and paying for a CAPTCHA
+# to do so) cannot help. These are fixed offline with a parser change + `reparse`.
+OFFLINE_FIXABLE = {AttemptStatus.PARSE_ERROR}
+
+
+class ProbeResult(StrEnum):
+    VALID = "valid"  # a known question still loads: the session works
+    EXPIRED = "expired"  # the site answered with the EULA / entry form or 401/403
+    UNKNOWN = "unknown"  # the probe itself failed (timeout, 5xx): no conclusion
+
 
 FAILURE_STATUSES = {
     AttemptStatus.PARSE_ERROR,
@@ -256,12 +267,15 @@ class Orchestrator:
 
         statuses = {} if refetch else await self.repo.attempt_statuses(state.id)
         done = {n for n, s in statuses.items() if s is AttemptStatus.STORED}
+        offline = sorted(n for n, s in statuses.items() if s in OFFLINE_FIXABLE)
+        networked = sorted(n for n, s in statuses.items() if s in FAILURE_STATUSES - OFFLINE_FIXABLE)
         if only_failed:
-            todo = sorted(n for n, s in statuses.items() if s in FAILURE_STATUSES)
+            todo = networked + [n for n in offline if not self._has_snapshot(session, n)]
             if not todo:
-                log.info("%s: no failed questions to reprocess", session.label)
-                report.outcome = SessionOutcome.SKIPPED
-                return report
+                return self._skip_without_network(session, state, statuses, report, offline)
+        elif state.collection_status is CollectionStatus.FAILED and not refetch and not networked:
+            # Discovery already finished; nothing a new download (and a new CAPTCHA) could fix.
+            return self._skip_without_network(session, state, statuses, report, offline)
 
         try:
             auth = await self.sessions.open(session, abort_if=abort_if)
@@ -289,6 +303,35 @@ class Orchestrator:
             await self.sessions.release(auth)
 
         return await self._finalize(state.id, session, report, highest, refine=only_failed)
+
+    def _has_snapshot(self, session: ExamSession, number: int) -> bool:
+        directory = self.settings.save_html_dir
+        return directory is not None and (directory / f"{session.session_code}_{number}.html").exists()
+
+    @staticmethod
+    def _skip_without_network(
+        session: ExamSession,
+        state: SessionState,
+        statuses: dict[int, AttemptStatus],
+        report: SessionReport,
+        offline: list[int],
+    ) -> SessionReport:
+        report.stored = sum(s is AttemptStatus.STORED for s in statuses.values())
+        report.discovered_question_count = state.discovered_question_count or 0
+        if offline:
+            report.outcome = SessionOutcome.INCOMPLETE
+            report.failed = {n: statuses[n].value for n in offline}
+            report.error = (
+                f"{len(offline)} question(s) failed to parse {offline[:10]}; downloading them again would return "
+                "the same page: fix the parser, then run `cem-scraper reparse` (no CAPTCHA, no network)"
+            )
+        elif not report.discovered_question_count and state.collection_status is CollectionStatus.FAILED:
+            report.outcome = SessionOutcome.INCOMPLETE
+            report.error = "no questions were found in an earlier run; use --refetch to try this session again"
+        else:
+            report.outcome = SessionOutcome.SKIPPED
+        log.info("%s: not opened (no CAPTCHA needed): %s", session.label, report.error or "nothing to do")
+        return report
 
     async def _finalize(
         self, session_id: int, session: ExamSession, report: SessionReport, highest: int, *, refine: bool
@@ -452,8 +495,9 @@ class Orchestrator:
                 if auth_failures and not in_flight:
                     auth = await self._resolve_auth_failures(auth, session_id, run_id, auth_failures, done)
                     for failure in auth_failures:
-                        if failure.status is AttemptStatus.MISSING:
-                            outcomes[failure.number] = AttemptStatus.MISSING
+                        if failure.status in (AttemptStatus.MISSING, AttemptStatus.SERVER_ERROR):
+                            outcomes[failure.number] = failure.status
+                            self._note_result(report, failure)
                         else:  # re-authorized: fetch it again with the new grant
                             heapq.heappush(retry, failure.number)
                     auth_failures.clear()
@@ -558,24 +602,43 @@ class Orchestrator:
         does not exist (recorded as missing). Otherwise authorization is gone:
         re-authorize within limits or stop.
         """
-        if done and await self._probe(auth, min(done)):
+        probe = await self._probe(auth, min(done)) if done else ProbeResult.EXPIRED
+        if probe is not ProbeResult.EXPIRED:
+            # VALID: the numbers simply do not exist. UNKNOWN: the probe itself failed, so we
+            # cannot tell; never pay for a re-authorization on a guess: retry them later.
+            status, error = (
+                (AttemptStatus.MISSING, "server returned the entry form; session still valid")
+                if probe is ProbeResult.VALID
+                else (AttemptStatus.SERVER_ERROR, "session could not be confirmed (probe failed); rerun to retry")
+            )
             for r in auth_failures:
-                r.status, r.error = AttemptStatus.MISSING, "server returned the entry form; session still valid"
+                r.status, r.error = status, error
                 await self.repo.record_attempt(session_id, r.number, r.status, r.error, run_id)  # type: ignore[arg-type]
                 self.metrics.reclassify_question(
-                    auth.session.session_code, AttemptStatus.AUTH_ERROR.value, AttemptStatus.MISSING.value
+                    auth.session.session_code, AttemptStatus.AUTH_ERROR.value, status.value
                 )
+            if probe is ProbeResult.UNKNOWN:
+                log.warning("%s: could not confirm the session; not re-authorizing on a guess", auth.session.label)
             return auth
         try:
             return await self.sessions.reauthorize(auth)
         except AccessBlocked as exc:
             raise _StopRun(SessionOutcome.BLOCKED, str(exc)) from exc
 
-    async def _probe(self, auth: AuthorizedSession, known_number: int) -> bool:
+    async def _probe(self, auth: AuthorizedSession, known_number: int) -> ProbeResult:
+        """Re-request a question known to exist and classify the answer (not a full parse)."""
         try:
             page = await auth.client.fetch_question(auth.session, known_number)
-            parse_question_page(page.html, expected_number=known_number)
-        except Exception as exc:  # any failure means we cannot confirm the session
+        except AccessDenied:
+            return ProbeResult.EXPIRED
+        except (ServerUnavailable, ServerThrottled) as exc:
+            raise _StopRun(SessionOutcome.ABORTED, str(exc)) from exc
+        except (RequestFailed, UnexpectedStatus) as exc:
             log.info("probe of q%d failed: %s", known_number, exc)
-            return False
-        return True
+            return ProbeResult.UNKNOWN
+        kind = classify_page(make_soup(page.html))
+        if kind is PageKind.QUESTION:
+            return ProbeResult.VALID
+        if kind in (PageKind.EULA, PageKind.ENTRY_FORM):
+            return ProbeResult.EXPIRED
+        return ProbeResult.UNKNOWN

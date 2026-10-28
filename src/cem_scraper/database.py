@@ -12,6 +12,7 @@ import logging
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -93,6 +94,7 @@ class Repository(Protocol):
     async def finish_run(self, run_id: uuid.UUID, status: RunStatus, metrics: dict[str, Any]) -> None: ...
     async def fetch_records(self, session_codes: list[str] | None = None) -> list[dict[str, Any]]: ...
     async def summaries(self) -> list[SessionSummary]: ...
+    async def captcha_spent_total(self) -> Decimal: ...
     async def close(self) -> None: ...
 
 
@@ -363,6 +365,15 @@ class PostgresRepository:
             rows = await cur.fetchall()
         return [SessionSummary(**row) for row in rows]
 
+    async def captcha_spent_total(self) -> Decimal:
+        """CAPTCHA money spent by all recorded runs (each run stores its own total on finish)."""
+        async with self._pool.connection() as conn:
+            cur = await conn.execute(
+                "SELECT coalesce(sum((diagnostics->>'captcha_cost')::numeric), 0) FROM scrape_runs"
+            )
+            row = await cur.fetchone()
+        return Decimal(str(row[0])) if row else Decimal(0)
+
     async def last_runs(self, limit: int = 5) -> list[dict[str, Any]]:
         async with self._pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
@@ -473,6 +484,11 @@ class InMemoryRepository:
                     }
                 )
         return records
+
+    async def captcha_spent_total(self) -> Decimal:
+        return sum(
+            (Decimal(str(run.get("metrics", {}).get("captcha_cost", 0))) for run in self.runs.values()), Decimal(0)
+        )
 
     async def summaries(self) -> list[SessionSummary]:
         result = []

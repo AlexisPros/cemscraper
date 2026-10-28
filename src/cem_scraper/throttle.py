@@ -47,6 +47,17 @@ class RateLimiter:
         """Hold back *all* future request starts by ``seconds`` (the server asked us to wait)."""
         self._next_slot = max(self._next_slot, self._clock() + seconds)
 
+    async def idle(self) -> None:
+        """Wait out a pending deferral (e.g. Retry-After) without reserving a slot.
+
+        Used before buying a CAPTCHA token: a token bought during a long pause
+        would expire before the form could be submitted.
+        """
+        wait = self._next_slot - self._clock()
+        if wait > self._interval:
+            log.info("waiting %.0fs for the server's pause before buying a CAPTCHA token", wait)
+            await self._sleep(wait)
+
     async def acquire(self) -> None:
         async with self._lock:
             now = self._clock()

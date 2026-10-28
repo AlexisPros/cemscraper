@@ -7,12 +7,13 @@ import asyncio
 import json
 import logging
 import sys
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
 from pydantic import ValidationError
 
-from cem_scraper.captcha import CaptchaUnavailable, build_captcha_provider
+from cem_scraper.captcha import CaptchaProvider, CaptchaUnavailable, TwoCaptchaProvider, build_captcha_provider
 from cem_scraper.config import EULA_PATH, FORM_PATH, AccessProviderName, Settings
 from cem_scraper.database import DatabaseUnavailable, InMemoryRepository, PostgresRepository, Repository
 from cem_scraper.exporter import export_records
@@ -84,10 +85,13 @@ async def cmd_scrape(args: argparse.Namespace) -> int:
     use_memory = args.memory or (args.dry_run and not args.db)
     repo: Repository = InMemoryRepository() if use_memory else await _postgres(settings)
     metrics = Metrics()
+    captcha = build_captcha_provider(settings, metrics)
     try:
-        provider = build_access_provider(settings, build_captcha_provider(settings, metrics))
+        await limit_captcha_spending(captcha, settings, repo)
+        provider = build_access_provider(settings, captcha)
     except AccessBlocked as exc:
         log.error("%s", exc)
+        await captcha.close()
         await repo.close()
         return EXIT_BLOCKED
     manager = SessionManager(settings, provider, metrics)
@@ -107,13 +111,38 @@ async def cmd_scrape(args: argparse.Namespace) -> int:
             count = export_records(await repo.fetch_records(codes), out, "jsonl", include_validation=True)
             print(f"wrote {count} records to {out}")
     finally:
-        await manager.close()
-        await repo.close()
+        try:
+            await manager.close()
+        finally:
+            await repo.close()  # always release the database, even if the browser was already gone
     _print_report(report)
     return {
         RunStatus.COMPLETED: EXIT_OK,
         RunStatus.BLOCKED: EXIT_BLOCKED,
     }.get(report.status, EXIT_PARTIAL)
+
+
+async def limit_captcha_spending(captcha: CaptchaProvider, settings: Settings, repo: Repository) -> None:
+    """Cap this run's paid CAPTCHAs by what is left of the lifetime budget recorded in the database."""
+    if not isinstance(captcha, TwoCaptchaProvider):
+        return
+    spent = await repo.captcha_spent_total()
+    total = Decimal(str(settings.captcha_total_budget))
+    remaining = total - spent
+    if remaining <= 0:
+        raise AccessBlocked(
+            f"lifetime CAPTCHA budget used up: {spent} spent of {total} (CEM_CAPTCHA_TOTAL_BUDGET); "
+            "raise it deliberately if you want to spend more"
+        )
+    captcha.max_spend = min(captcha.max_spend, remaining)
+    log.info(
+        "2Captcha budget: %s spent in earlier runs, %s left of %s; this run may spend up to %s (max %d solves)",
+        spent,
+        remaining,
+        total,
+        captcha.max_spend,
+        captcha.max_solves,
+    )
 
 
 def _print_report(report: RunReport) -> None:

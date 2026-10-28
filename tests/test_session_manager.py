@@ -164,3 +164,24 @@ async def test_fixture_provider_serves_files(settings: Settings) -> None:
     assert "Syntetyczne pytanie testowe nr 2" in page.html
     assert "Brak pytania" in missing.html
     assert provider.requests[0]["nr_pytania"] == "2"
+
+
+async def test_interactive_close_tolerates_a_browser_killed_by_ctrl_c(settings: Settings) -> None:
+    """Ctrl+C reaches the browser first; closing it afterwards must not raise."""
+    from cem_scraper.session_manager import InteractiveBrowserAccessProvider
+
+    class Gone:
+        closed = 0
+
+        async def close(self) -> None:
+            Gone.closed += 1
+            raise RuntimeError("Target page, context or browser has been closed")
+
+        async def stop(self) -> None:
+            Gone.closed += 1
+            raise RuntimeError("Connection closed while reading from the driver")
+
+    provider = InteractiveBrowserAccessProvider(settings)
+    provider._context, provider._browser, provider._playwright = Gone(), Gone(), Gone()
+    await provider.close()  # must not raise
+    assert Gone.closed == 3 and provider._context is None

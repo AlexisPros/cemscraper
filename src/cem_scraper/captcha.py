@@ -41,11 +41,19 @@ class CaptchaUnavailable(Exception):
     """No CAPTCHA token can be obtained (not configured, budget reached, account or service problem)."""
 
 
+# Google: a reCAPTCHA response token is valid for two minutes.
+TOKEN_LIFETIME_S = 120.0
+
+
 @dataclass
 class CaptchaSolution:
     token: str = field(repr=False)
     task_id: str
     cost: Decimal = Decimal(0)
+    solved_at: float = field(default_factory=time.monotonic)
+
+    def age(self) -> float:
+        return time.monotonic() - self.solved_at
 
 
 class CaptchaProvider(ABC):
@@ -144,14 +152,28 @@ class TwoCaptchaProvider(CaptchaProvider):
     async def close(self) -> None:
         await self._http.aclose()
 
-    async def _call(self, method: str, **payload: Any) -> dict[str, Any]:
+    async def _call(self, method: str, *, paid: bool = False, **payload: Any) -> dict[str, Any]:
+        """POST one API method.
+
+        Free methods are retried on any transport/HTTP error. A ``paid`` call
+        (createTask) is retried only when the request provably never left this
+        machine (connection not established): if it may have reached 2Captcha, the
+        task may exist and resending it would pay for a second CAPTCHA.
+        """
         if not self._key:
             raise CaptchaUnavailable("CEM_TWOCAPTCHA_API_KEY is not set")
         body = {"clientKey": self._key.get_secret_value(), **payload}
         for attempt in range(3):
             try:
                 response = await self._http.post(f"/{method}", json=body)
+            except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as exc:
+                error = f"{type(exc).__name__} (request not sent)"
             except httpx.HTTPError as exc:
+                if paid:
+                    raise CaptchaUnavailable(
+                        f"2Captcha {method}: {type(exc).__name__}; the task may have been created, "
+                        "so it is not resent (that could charge twice)"
+                    ) from exc
                 error = f"{type(exc).__name__}"
             else:
                 if response.status_code == 200:
@@ -159,6 +181,10 @@ class TwoCaptchaProvider(CaptchaProvider):
                     if data.get("errorId", 0) != 0:
                         raise TwoCaptchaApiError(str(data.get("errorCode")), str(data.get("errorDescription", "")))
                     return data
+                if paid:
+                    raise CaptchaUnavailable(
+                        f"2Captcha {method}: HTTP {response.status_code}; not resent to avoid paying twice"
+                    )
                 error = f"HTTP {response.status_code}"
             log.warning("2Captcha %s failed (%s), attempt %d", method, error, attempt + 1)
             await self._sleep(5.0)
@@ -188,7 +214,7 @@ class TwoCaptchaProvider(CaptchaProvider):
         last_error = "no attempt"
         for attempt in range(self.max_tasks_per_solve):
             try:
-                created = await self._call("createTask", task=task)
+                created = await self._call("createTask", paid=True, task=task)
                 task_id = created["taskId"]
                 solution = await self._wait_for(task_id)
             except TwoCaptchaApiError as exc:

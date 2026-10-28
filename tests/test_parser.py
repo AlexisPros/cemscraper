@@ -410,3 +410,23 @@ def test_comments_block_is_ignored() -> None:
         '<div id="uwagi1" style="display: none;"><p><b>A.</b> komentarz</p></div><div id="odpowiedz1"',
     )
     assert parse_question_page(html).question_data.options["A"] == "opcja a"
+
+
+def test_entry_form_includes_named_submit_button_like_a_browser() -> None:
+    """Live PES form: hidden typ/konfirm/autoryzacja and <input type=submit name=submit value="Pokaż pytanie">."""
+    html = (
+        '<form action="wyswietl_pytania_pes.php" method="post"><select name="sesja"><option value="20031">wiosna 2003'
+        '</option></select><input type="hidden" name="typ" value="PES"><input type="hidden" name="konfirm" value="">'
+        '<div class="g-recaptcha" data-sitekey="k"></div><input type="submit" name="submit" value="Pokaż pytanie">'
+        '<input type="hidden" name="autoryzacja" value="1"></form>'
+    )
+    form = parse_entry_form(html)
+    assert form.fields == {
+        "sesja": "20031",
+        "typ": "PES",
+        "konfirm": "",
+        "submit": "Pokaż pytanie",
+        "autoryzacja": "1",
+    }
+    unnamed = parse_entry_form(load(EDGE / "entry_form.html"))
+    assert "submit" not in unnamed.fields  # an unnamed button sends nothing

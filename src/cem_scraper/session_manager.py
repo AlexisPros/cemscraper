@@ -16,8 +16,12 @@ authorization state; when a grant is missing or expired it stops and reports.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import json
 import logging
 import re
+import shutil
+import sys
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -28,7 +32,7 @@ from urllib.parse import parse_qs, urlsplit
 
 import httpx
 
-from cem_scraper.captcha import CaptchaProvider, CaptchaUnavailable
+from cem_scraper.captcha import TOKEN_LIFETIME_S, CaptchaProvider, CaptchaUnavailable
 from cem_scraper.client import CemClient, ClientError, sanitize_snapshot
 from cem_scraper.config import (
     EULA_PATH,
@@ -195,10 +199,18 @@ class HttpFormAccessProvider(AccessProvider):
                 "specjalizacja": session.specialization_code,
                 "nr_pytania": "1",
             }
+            # Everything that can fail cheaply has been checked; now wait out any server pause
+            # so the token (valid ~2 min) is not bought too early, then pay for it.
+            await client.traffic.limiter.idle()
             solution = await self.captcha.solve(site_key=form.recaptcha_sitekey, page_url=form_page.url)
             fields["g-recaptcha-response"] = solution.token
+            age = solution.age()
+            log.info("submitting the form %.0fs after the CAPTCHA was solved", age)
+            if age > TOKEN_LIFETIME_S:
+                log.warning("the token is %.0fs old and has probably expired", age)
             try:
-                first = await client.post(form.action or QUESTION_PATH, fields)
+                # Exactly one attempt: a token is single-use, resending it cannot help.
+                first = await client.post(form.action or QUESTION_PATH, fields, retries=0)
             finally:
                 fields.pop("g-recaptcha-response", None)  # single use, never kept
         except CaptchaUnavailable as exc:
@@ -398,13 +410,172 @@ class InteractiveBrowserAccessProvider(AccessProvider):
             log.warning("could not pre-fill nr_pytania")
 
     async def close(self) -> None:
-        if self._context is not None:
-            await self._context.close()
-        if self._browser is not None:
-            await self._browser.close()
+        # Ctrl+C in a terminal also reaches the Playwright driver and the browser, so they
+        # may already be gone: closing them must not turn an interruption into a traceback.
+        for closer in (self._context, self._browser):
+            if closer is not None:
+                try:
+                    await closer.close()
+                except Exception as exc:
+                    log.debug("browser already closed: %s", exc)
         if self._playwright is not None:
-            await self._playwright.stop()
+            try:
+                await self._playwright.stop()
+            except Exception as exc:
+                log.debug("playwright driver already stopped: %s", exc)
         self._context = self._browser = self._playwright = None
+
+
+# --------------------------------------------------------------------------- your own Chrome
+
+
+def default_chrome_path() -> Path | None:
+    candidates = {
+        "darwin": ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"],
+        "win32": [
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        ],
+    }.get(sys.platform, [])
+    for candidate in candidates:
+        if Path(candidate).exists():
+            return Path(candidate)
+    for name in ("google-chrome", "google-chrome-stable", "chromium", "chromium-browser"):
+        if found := shutil.which(name):
+            return Path(found)
+    return None
+
+
+class ManualChromeAccessProvider(AccessProvider):
+    """You pass the EULA and the reCAPTCHA in your own Google Chrome; the tool takes over afterwards.
+
+    Chrome is started as a normal browser (separate persistent profile, local
+    DevTools port) and is *not* automated while you use it: the tool only opens
+    a tab with ``eula_pes.php`` and watches the tab list (``/json/list``)
+    without attaching to any page. Once the tab shows a question page, the
+    session cookie is read at browser level (``Storage.getCookies``) and the
+    collection continues over HTTPX. Nothing is hidden or faked: the check
+    simply happens in a browser that a human is using.
+    """
+
+    name = "manual_chrome"
+    interactive = True
+
+    def __init__(self, settings: Settings, *, poll_interval: float = 1.0) -> None:
+        self.settings = settings
+        self.poll_interval = poll_interval
+        self._devtools = httpx.AsyncClient(base_url=f"http://127.0.0.1:{settings.chrome_debug_port}", timeout=5.0)
+        self._process: asyncio.subprocess.Process | None = None
+
+    async def _devtools_alive(self) -> bool:
+        try:
+            return (await self._devtools.get("/json/version")).status_code == 200
+        except httpx.HTTPError:
+            return False
+
+    async def _ensure_chrome(self) -> None:
+        if await self._devtools_alive():
+            return  # already running (started by us earlier, or by you with the same port)
+        chrome = self.settings.chrome_path or default_chrome_path()
+        if chrome is None or not chrome.exists():
+            raise AccessBlocked("Google Chrome not found; install it or set CEM_CHROME_PATH")
+        profile = (self.settings.browser_profile_dir or Path("browser_profile")).resolve()
+        profile.mkdir(parents=True, exist_ok=True)
+        self._process = await asyncio.create_subprocess_exec(
+            str(chrome),
+            f"--remote-debugging-port={self.settings.chrome_debug_port}",
+            f"--user-data-dir={profile}",  # Chrome refuses remote debugging on the default profile
+            "--no-first-run",
+            "--no-default-browser-check",
+            *self.settings.chrome_extra_args,
+            "about:blank",
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+            # Own process group: Ctrl+C in the terminal stops the scraper, which then closes
+            # Chrome in order, instead of the signal killing Chrome mid-cleanup.
+            start_new_session=True,
+        )
+        for _ in range(150):
+            if await self._devtools_alive():
+                log.info("Chrome started with profile %s", profile)
+                return
+            await asyncio.sleep(0.1)
+        raise AccessBlocked(f"Chrome did not open its DevTools port {self.settings.chrome_debug_port}")
+
+    async def _browser_cookies(self) -> list[dict[str, Any]]:
+        import websockets  # optional dependency of the "browser" extra
+
+        endpoint = (await self._devtools.get("/json/version")).json()["webSocketDebuggerUrl"]
+        async with websockets.connect(endpoint, max_size=None) as socket:
+            await socket.send(json.dumps({"id": 1, "method": "Storage.getCookies"}))
+            while True:
+                message = json.loads(await socket.recv())
+                if message.get("id") == 1:
+                    break
+        if "error" in message:
+            raise AccessBlocked(f"could not read cookies from Chrome: {message['error']}")
+        cookies: list[dict[str, Any]] = message["result"]["cookies"]
+        return cookies
+
+    async def acquire(self, session: ExamSession, client: CemClient) -> AccessGrant:
+        await self._ensure_chrome()
+        try:
+            tab = (await self._devtools.put(f"/json/new?{self.settings.url(EULA_PATH)}")).json()
+        except httpx.HTTPError as exc:
+            raise AccessBlocked(f"could not open a Chrome tab: {exc}") from exc
+        log.warning(
+            "ACTION REQUIRED in Chrome: accept the terms, choose %s / PES / Psychiatria / question 1, "
+            "pass the CAPTCHA and click 'Pokaż pytanie'. Waiting up to %.0fs...",
+            session.label,
+            self.settings.browser_wait_timeout,
+        )
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.settings.browser_wait_timeout
+        question_url: str | None = None
+        while question_url is None:
+            if loop.time() > deadline:
+                raise AccessBlocked(f"no question page in Chrome for {session.label} within the time limit")
+            await asyncio.sleep(self.poll_interval)
+            try:
+                targets = (await self._devtools.get("/json/list")).json()
+            except httpx.HTTPError as exc:
+                raise AccessBlocked(f"Chrome is no longer reachable: {exc}") from exc
+            current = next((t for t in targets if t.get("id") == tab["id"]), None)
+            if current is None:
+                raise AccessBlocked(f"the Chrome tab for {session.label} was closed")
+            if QUESTION_URL_RE.match(current.get("url", "")):
+                question_url = current["url"]
+
+        hosts = {h for h in (urlsplit(self.settings.base_url).hostname, urlsplit(question_url).hostname) if h}
+        for cookie in await self._browser_cookies():
+            domain = cookie["domain"].lstrip(".")
+            if any(host == domain or host.endswith("." + domain) for host in hosts):
+                client.cookies.set(cookie["name"], cookie["value"], domain=cookie["domain"], path=cookie["path"])
+        try:
+            first = await client.post(question_url, client.question_payload(session, 1))
+        except ClientError as exc:
+            raise AccessBlocked(f"session check failed: {exc}") from exc
+        if classify_page(make_soup(first.html)) is not PageKind.QUESTION:
+            raise AccessBlocked("the session from Chrome was not accepted by CEM for HTTP requests")
+        verify_shown_session(first.html, session)
+        with contextlib.suppress(httpx.HTTPError):
+            await self._devtools.get(f"/json/close/{tab['id']}")
+        log.info("session %s authorized in Chrome", session.label)
+        return AccessGrant(
+            session_code=session.session_code, provider=self.name, first_page_html=first.html, question_url=question_url
+        )
+
+    async def close(self) -> None:
+        await self._devtools.aclose()
+        if self._process is not None and self._process.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                self._process.terminate()
+            try:
+                await asyncio.wait_for(self._process.wait(), 10)
+            except TimeoutError:
+                with contextlib.suppress(ProcessLookupError):
+                    self._process.kill()
+        self._process = None
 
 
 # --------------------------------------------------------------------------- manager
@@ -416,6 +587,8 @@ def build_access_provider(settings: Settings, captcha: CaptchaProvider) -> Acces
             return FixtureAccessProvider(settings.fixtures_dir)
         case AccessProviderName.HTTP_FORM:
             return HttpFormAccessProvider(settings, captcha)
+        case AccessProviderName.MANUAL_CHROME:
+            return ManualChromeAccessProvider(settings)
         case AccessProviderName.INTERACTIVE_BROWSER:
             return InteractiveBrowserAccessProvider(settings, use_context_requests=settings.browser_context_requests)
     raise AccessBlocked(f"unknown access provider {settings.access_provider!r}")

@@ -153,12 +153,16 @@ class CemClient:
         cap = min(self.settings.backoff_max, self.settings.backoff_base * (2**attempt))
         return random.uniform(0, cap)  # full jitter
 
-    async def request(self, method: str, path: str, data: Mapping[str, str] | None = None) -> PageResponse:
+    async def request(
+        self, method: str, path: str, data: Mapping[str, str] | None = None, *, retries: int | None = None
+    ) -> PageResponse:
+        """Send with retries. ``retries=0`` for requests that must not be repeated (a CAPTCHA token)."""
+        max_retries = self.settings.max_retries if retries is None else retries
         breaker = self.traffic.breaker
         if breaker.open:
             raise ServerUnavailable("circuit breaker open: too many consecutive server failures")
         last_error = "unknown error"
-        for attempt in range(self.settings.max_retries + 1):
+        for attempt in range(max_retries + 1):
             delay: float | None = None
             ticket = await self.traffic.concurrency.acquire()
             latency: float | None = None
@@ -200,7 +204,7 @@ class CemClient:
                     log.warning("%s %s -> HTTP %d (attempt %d)", method, path, status, attempt + 1)
             finally:
                 self.traffic.concurrency.release(ticket, latency, overloaded=overloaded)
-            if attempt == self.settings.max_retries:
+            if attempt == max_retries:
                 break
             self.metrics.record_retry()
             if delay is not None:
@@ -217,13 +221,13 @@ class CemClient:
             raise ServerUnavailable(
                 f"{breaker.consecutive_failures} consecutive requests failed after retries; last: {last_error}"
             )
-        raise RequestFailed(f"{method} {path} failed after {self.settings.max_retries + 1} attempts: {last_error}")
+        raise RequestFailed(f"{method} {path} failed after {max_retries + 1} attempt(s): {last_error}")
 
     async def get(self, path: str) -> PageResponse:
         return await self.request("GET", path)
 
-    async def post(self, path: str, data: Mapping[str, str]) -> PageResponse:
-        return await self.request("POST", path, data=data)
+    async def post(self, path: str, data: Mapping[str, str], *, retries: int | None = None) -> PageResponse:
+        return await self.request("POST", path, data=data, retries=retries)
 
     def question_payload(self, session: ExamSession, number: int) -> dict[str, str]:
         """Navigation form fields observed in an authorized browser session.
