@@ -32,6 +32,7 @@ class Metrics:
     questions_failed: int = 0
     outcomes: Counter[str] = field(default_factory=Counter)
     per_session: dict[str, Counter[str]] = field(default_factory=lambda: defaultdict(Counter))
+    concurrency_changes: list[dict[str, Any]] = field(default_factory=list)
 
     def record_request(self, duration: float, status_code: int | None, ok: bool) -> None:
         self.requests += 1
@@ -42,6 +43,9 @@ class Metrics:
             self.request_successes += 1
         else:
             self.request_failures += 1
+
+    def record_concurrency_change(self, limit: int, reason: str) -> None:
+        self.concurrency_changes.append({"t": round(self.elapsed, 1), "limit": limit, "reason": reason})
 
     def record_retry(self) -> None:
         self.retries += 1
@@ -91,6 +95,7 @@ class Metrics:
             "questions_per_minute": round(self.questions_succeeded / minutes, 2) if minutes > 0 else None,
             "total_duration_s": round(self.elapsed, 2),
             "per_session": {code: dict(c) for code, c in sorted(self.per_session.items())},
+            "concurrency_changes": self.concurrency_changes,
         }
 
     def summary_line(self) -> str:

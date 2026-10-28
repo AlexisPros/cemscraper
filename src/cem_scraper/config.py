@@ -10,7 +10,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Annotated
 
-from pydantic import Field, SecretStr, field_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 BASE_URL = "https://www.cem.edu.pl/pytcem/"
@@ -53,7 +53,11 @@ class Settings(BaseSettings):
     contact_email: str | None = None
 
     # Throughput: deliberately conservative defaults.
+    # Initial in-flight limit; with adaptive concurrency it moves within [1, max_concurrency].
     concurrency: int = Field(default=2, ge=1, le=8)
+    max_concurrency: int = Field(default=4, ge=1, le=8)
+    adaptive_concurrency: bool = True
+    latency_tolerance: float = Field(default=1.5, gt=1)
     requests_per_second: float = Field(default=0.5, gt=0, le=5)
     connect_timeout: float = Field(default=10.0, gt=0)
     read_timeout: float = Field(default=45.0, gt=0)
@@ -79,6 +83,9 @@ class Settings(BaseSettings):
     # Headless is only useful for automated tests: a human must see the window to solve the CAPTCHA.
     browser_headless: bool = False
     max_reauthorizations_per_session: int = Field(default=1, ge=0)
+    # Exam sessions open at once: the next one is authorized while the current one is collected.
+    # Authorizations (CAPTCHAs) still happen one at a time; 1 = strictly sequential.
+    pipeline_depth: int = Field(default=2, ge=1, le=4)
     # Send question requests through the authorized browser context instead of copying cookies.
     browser_context_requests: bool = False
 
@@ -95,6 +102,12 @@ class Settings(BaseSettings):
         if isinstance(value, str):
             return [part.strip() for part in value.split(",") if part.strip()]
         return value
+
+    @model_validator(mode="after")
+    def _concurrency_bounds(self) -> Settings:
+        if self.max_concurrency < self.concurrency:
+            raise ValueError(f"max_concurrency ({self.max_concurrency}) < concurrency ({self.concurrency})")
+        return self
 
     @field_validator("log_level")
     @classmethod

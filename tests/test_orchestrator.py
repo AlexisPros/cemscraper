@@ -245,7 +245,8 @@ async def test_expired_authorization_without_reauth_blocks_run(fast: Settings) -
         return question_page(number=number) if number < 3 else ENTRY_FORM
 
     provider = ScriptedProvider(respond, grants_left=1)
-    orchestrator, repo = build(fast.model_copy(update={"max_reauthorizations_per_session": 0}), provider)
+    sequential = fast.model_copy(update={"max_reauthorizations_per_session": 0, "pipeline_depth": 1})
+    orchestrator, repo = build(sequential, provider)
     # Probe of a known question also fails once authorization is gone:
     provider.responder = lambda s, n, p: (
         ENTRY_FORM if p.requested.count((s, n)) > 1 or n >= 3 else question_page(number=n)
@@ -274,8 +275,8 @@ async def test_server_failure_aborts_run(fast: Settings) -> None:
     orchestrator, _ = build(settings, provider)
     report = await orchestrator.run(["20031", "20262"])
     assert report.status is RunStatus.FAILED
-    assert report.sessions[0].outcome is SessionOutcome.ABORTED
-    assert len(report.sessions) == 1
+    # The pipelined second session is stopped as well instead of continuing to hit the server.
+    assert [s.outcome for s in report.sessions] == [SessionOutcome.ABORTED, SessionOutcome.ABORTED]
 
 
 async def test_cancellation_marks_run_interrupted(fast: Settings) -> None:
@@ -320,7 +321,7 @@ async def test_resume_with_postgres(fast: Settings, pg_repo: PostgresRepository)
 
     provider = ScriptedProvider(respond)
     orchestrator, _ = build(fast.model_copy(update={"concurrency": 1}), provider, pg_repo)
-    with pytest.raises(ExceptionGroup):
+    with pytest.raises(RuntimeError, match="simulated crash"):
         await orchestrator.run(["20031"])
     assert len(await pg_repo.fetch_records()) == 3
 
@@ -346,3 +347,110 @@ async def test_export_json_and_jsonl(fast: Settings, tmp_path: Path) -> None:
     lines = (tmp_path / "out.jsonl").read_text(encoding="utf-8").splitlines()
     assert json.loads(lines[-1])["validation_status"] == "valid"
     assert "ą" in (tmp_path / "out.json").read_text(encoding="utf-8")  # not \u-escaped
+
+
+# --------------------------------------------------------------------------- sliding window & pipeline
+
+
+class EventProvider(ScriptedProvider):
+    """Records ("auth", code) / ("start"|"end", code, n) events; optional per-question delays."""
+
+    def __init__(self, total: int, *, delays: dict[int, float] | None = None, auth_delay: float = 0.0) -> None:
+        super().__init__(default_responder(total))
+        self.events: list[tuple[object, ...]] = []
+        self.delays = delays or {}
+        self.auth_delay = auth_delay
+        self.authorizing = 0
+        self.max_parallel_auth = 0
+
+    def base_transport(self) -> httpx.AsyncBaseTransport:
+        outer = self
+
+        class Recording(httpx.AsyncBaseTransport):
+            async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+                form = {k: v[0] for k, v in parse_qs(request.content.decode()).items()}
+                code, number = form["sesja"], int(form["nr_pytania"])
+                outer.events.append(("start", code, number))
+                await asyncio.sleep(outer.delays.get(number, 0.001))
+                response = outer._handler(request)
+                outer.events.append(("end", code, number))
+                return response
+
+        return Recording()
+
+    async def acquire(self, session: ExamSession, client: CemClient) -> AccessGrant:
+        self.authorizing += 1
+        self.max_parallel_auth = max(self.max_parallel_auth, self.authorizing)
+        try:
+            await asyncio.sleep(self.auth_delay)
+            self.events.append(("auth", session.session_code))
+            return await super().acquire(session, client)
+        finally:
+            self.authorizing -= 1
+
+    def index(self, event: tuple[object, ...]) -> int:
+        return self.events.index(event)
+
+    def last(self, kind: str, code: str) -> int:
+        return max(i for i, e in enumerate(self.events) if e[0] == kind and e[1] == code)
+
+
+async def test_slow_response_does_not_hold_back_the_window(fast: Settings) -> None:
+    provider = EventProvider(6, delays={2: 0.3})
+    orchestrator, repo = build(fast.model_copy(update={"adaptive_concurrency": False}), provider)
+    await orchestrator.run(["20031"])
+    # With a batch barrier question 4 would wait for the slow question 2.
+    assert provider.index(("start", "20031", 4)) < provider.index(("end", "20031", 2))
+    assert [r["question_number"] for r in await repo.fetch_records()] == [1, 2, 3, 4, 5, 6]
+
+
+async def test_next_session_is_authorized_while_current_is_collected(fast: Settings) -> None:
+    provider = EventProvider(8)
+    orchestrator, repo = build(fast.model_copy(update={"pipeline_depth": 2}), provider)
+    report = await orchestrator.run(["20031", "20262"])
+    assert report.status is RunStatus.COMPLETED
+    assert provider.index(("auth", "20262")) < provider.last("end", "20031")
+    assert len(await repo.fetch_records()) == 16
+
+
+async def test_pipeline_depth_one_is_sequential(fast: Settings) -> None:
+    provider = EventProvider(8)
+    orchestrator, _ = build(fast.model_copy(update={"pipeline_depth": 1}), provider)
+    await orchestrator.run(["20031", "20262"])
+    assert provider.index(("auth", "20262")) > provider.last("end", "20031")
+
+
+async def test_authorizations_never_overlap(fast: Settings) -> None:
+    provider = EventProvider(3, auth_delay=0.05)
+    orchestrator, _ = build(fast.model_copy(update={"pipeline_depth": 3}), provider)
+    report = await orchestrator.run(["20031", "20032", "20262"])
+    assert report.status is RunStatus.COMPLETED
+    assert provider.max_parallel_auth == 1  # one CAPTCHA at a time for the user
+
+
+async def test_no_further_authorization_after_a_blocked_session(fast: Settings) -> None:
+    class BlockFirst(EventProvider):
+        async def acquire(self, session: ExamSession, client: CemClient) -> AccessGrant:
+            await asyncio.sleep(0.02)  # the second session is now waiting for its turn
+            self.events.append(("auth", session.session_code))
+            raise AccessBlocked("user did not solve the CAPTCHA in time")
+
+    provider = BlockFirst(3)
+    orchestrator, repo = build(fast.model_copy(update={"pipeline_depth": 2}), provider)
+    report = await orchestrator.run(["20031", "20262"])
+    assert report.status is RunStatus.BLOCKED
+    assert [s.outcome for s in report.sessions] == [SessionOutcome.BLOCKED, SessionOutcome.NOT_STARTED]
+    assert provider.events == [("auth", "20031")]  # no second CAPTCHA requested
+    state = await repo.ensure_session(ExamSession.from_code("20262"))
+    assert state.collection_status is CollectionStatus.PENDING  # untouched: resumes normally
+
+
+async def test_parallel_sessions_share_one_rate_limit(fast: Settings) -> None:
+    provider = EventProvider(4)
+    metrics = Metrics()
+    manager = SessionManager(fast, provider, metrics)
+    first = await manager.open(ExamSession.from_code("20031"))
+    second = await manager.open(ExamSession.from_code("20262"))
+    assert first.client.traffic is second.client.traffic is manager.traffic
+    await manager.release(first)
+    await manager.release(second)

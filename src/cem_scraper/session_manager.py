@@ -15,8 +15,10 @@ authorization state; when a grant is missing or expired it stops and reports.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -38,12 +40,17 @@ from cem_scraper.config import (
 from cem_scraper.metrics import Metrics
 from cem_scraper.models import ExamSession
 from cem_scraper.parser import PageKind, classify_page, make_soup, parse_entry_form
+from cem_scraper.throttle import TrafficControl
 
 log = logging.getLogger(__name__)
 
 
 class AccessBlocked(Exception):
     """Authorized access could not be obtained; collection for this session must stop."""
+
+
+class OpenCancelled(Exception):
+    """The run stopped while this session was waiting for its turn to be authorized."""
 
 
 @dataclass
@@ -353,23 +360,39 @@ class AuthorizedSession:
 
 
 class SessionManager:
-    """Owns one authorized ``CemClient`` per examination session at a time."""
+    """Hands out authorized ``CemClient``s, one per examination session.
 
-    def __init__(self, settings: Settings, provider: AccessProvider, metrics: Metrics) -> None:
+    All clients share one ``TrafficControl``, so collecting sessions in parallel
+    never multiplies the request rate. Authorizations are serialized: at most one
+    official-form entry (one CAPTCHA for the user) is in progress at a time.
+    """
+
+    def __init__(
+        self,
+        settings: Settings,
+        provider: AccessProvider,
+        metrics: Metrics,
+        traffic: TrafficControl | None = None,
+    ) -> None:
         self.settings = settings
         self.provider = provider
         self.metrics = metrics
+        self.traffic = traffic or TrafficControl(settings, metrics)
+        self._authorizing = asyncio.Lock()
 
     def _new_client(self, transport: httpx.AsyncBaseTransport | None) -> CemClient:
-        return CemClient(self.settings, self.metrics, transport=transport)
+        return CemClient(self.settings, self.metrics, transport=transport, traffic=self.traffic)
 
-    async def open(self, session: ExamSession) -> AuthorizedSession:
-        client = self._new_client(self.provider.base_transport())
-        try:
-            grant = await self.provider.acquire(session, client)
-        except BaseException:
-            await client.aclose()
-            raise
+    async def open(self, session: ExamSession, *, abort_if: Callable[[], bool] | None = None) -> AuthorizedSession:
+        async with self._authorizing:
+            if abort_if is not None and abort_if():  # don't ask for another CAPTCHA for a stopping run
+                raise OpenCancelled(f"run stopped before {session.label} was authorized")
+            client = self._new_client(self.provider.base_transport())
+            try:
+                grant = await self.provider.acquire(session, client)
+            except BaseException:
+                await client.aclose()
+                raise
         if grant.transport is not None:
             await client.aclose()
             client = self._new_client(grant.transport)

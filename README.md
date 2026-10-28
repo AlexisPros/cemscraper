@@ -19,12 +19,12 @@ plus Autumn 2026. Results go into PostgreSQL (JSONB columns), and you can export
 
 ```
 CLI (main.py)
-  └─ Orchestrator ── for each exam session: discover questions 1..N, resume, classify failures
+  └─ Orchestrator ── session pipeline; per session: discover questions 1..N, resume, classify failures
        ├─ SessionManager ── AccessProvider ─┬─ InteractiveBrowserAccessProvider (Playwright; you solve CAPTCHA)
-       │                                    ├─ HttpFormAccessProvider (EULA + form; needs authorized CaptchaProvider)
+       │   (one authorization at a time)    ├─ HttpFormAccessProvider (EULA + form; needs authorized CaptchaProvider)
        │                                    └─ FixtureAccessProvider (offline, local HTML)
-       ├─ CemClient (httpx.AsyncClient: pooling, rate limit, concurrency cap, retries+jitter,
-       │             Retry-After, circuit breaker, metrics)
+       ├─ CemClient (httpx.AsyncClient: pooling, retries+jitter, Retry-After, metrics)
+       │    └─ TrafficControl, shared by all clients: rate limit, adaptive concurrency, circuit breaker
        ├─ parser (pure: BeautifulSoup+lxml → Pydantic models; works on saved files)
        └─ Repository ─┬─ PostgresRepository (psycopg 3 async pool, migrations, UPSERT)
                       └─ InMemoryRepository (dry runs / tests)
@@ -36,6 +36,7 @@ CLI (main.py)
 | `models.py` | `ExamSession`, `QuestionData`, `CorrectAnswer`, `AnswerStatistics`, `ScrapedQuestion`, status enums |
 | `parser.py` | Question page parsing, page classification, entry-form parsing, charset decoding |
 | `client.py` | Async HTTP client and failure classes |
+| `throttle.py` | Shared rate limiter, adaptive concurrency controller, circuit breaker |
 | `captcha.py` | `CaptchaProvider` interface + `DisabledCaptchaProvider` |
 | `session_manager.py` | EULA/session entry, access providers, grant lifecycle, re-authorization limit |
 | `orchestrator.py` | Discovery, resume, error classification, auth-expiry probing, run bookkeeping |
@@ -56,9 +57,38 @@ This is a port of the JavaScript parser that was verified manually:
 6. The answer letter comes from the hidden `#odpowiedz1`. Statistics come from `#statystyki1 table`, matched by **normalized header names**, so extra columns (`M.D.`, `RPBI A–E`) don't matter. Those extra columns are kept separately in `questions.extra_statistics`.
 7. Images and tables inside a question are recorded as `attachments`, and the question is flagged `needs_review`. They are never dropped silently.
 
+### Throughput: adaptive concurrency and the session pipeline
+
+CEM answers either fast (~0.2 s) or very slowly (~10 s, waiting for the first byte).
+The **request rate** is always capped by `CEM_REQUESTS_PER_SECOND` (default 0.5/s).
+What adapts is how many requests may *wait for an answer* at once. By Little's law,
+sustaining 0.5 req/s at 10 s latency needs about 5 in flight, while a fixed 2 would
+drop to 0.2 req/s. The controller (`throttle.py`) works per window of completed requests:
+
+- it raises the limit by 1 toward `ceil(rate × median latency)`, capped at `CEM_MAX_CONCURRENCY` (4);
+- it undoes the increase if the median latency then grows by more than `CEM_LATENCY_TOLERANCE` (1.5×), because the server is queueing because of us;
+- it halves the limit once per burst of timeouts, 429s or 5xx responses, then pauses increases;
+- it lowers the limit when fewer requests in flight are enough.
+
+Changes are logged and stored in the run's `diagnostics.concurrency_changes`.
+Questions are dispatched through a sliding window, so one slow answer doesn't hold
+back the others.
+
+**Session pipeline** (`CEM_PIPELINE_DEPTH`, default 2): while one session is being
+collected, the next one is already being authorized. In interactive mode you solve its
+CAPTCHA while the tool keeps working, and the grant is used at once, so it can't
+expire while idle. Authorizations stay strictly one at a time. All sessions share one
+rate limiter, one concurrency limit and one circuit breaker, so the server sees the
+same load as with one session.
+
+If a session is blocked, no further CAPTCHAs are requested. If the server fails, every
+open session stops. In a 10×-compressed simulation (2 sessions × 30 questions, 10 s
+latency, 30 s per CAPTCHA), collection took 3.9 min instead of 6.8 min (1.8×) with the
+same request-rate cap.
+
 ### Discovery and failure classification
 
-Questions are requested from 1 upward in batches of `CEM_CONCURRENCY`. A session
+Questions are requested from 1 upward through the sliding window. A session
 ends after `CEM_MISSING_STREAK_TO_STOP` consecutive missing questions past the
 highest one found. Gaps are recorded as `missing`, and one failure never stops
 collection. If a page reports a total ("… z 120"), that total also bounds the search.
@@ -153,7 +183,8 @@ marked `interrupted`, and rerunning the same command resumes it.
 ### Configuration
 
 Every setting is an environment variable with the `CEM_` prefix; see `.env.example`.
-The defaults are conservative: **2 concurrent requests, 0.5 requests/s**, a 45 s read
+The defaults are conservative: **0.5 requests/s; 2 requests in flight, adaptive up to 4**,
+2 sessions in the pipeline, a 45 s read
 timeout (CEM sometimes takes about 10 s), 4 retries with full-jitter exponential
 backoff, `Retry-After` honored up to 300 s (anything longer stops the run), and a
 circuit breaker after 5 consecutive failed requests. The validator caps concurrency
@@ -162,6 +193,8 @@ at 8 and the rate at 5 req/s.
 | Setting | Meaning |
 |---|---|
 | `CEM_ACCESS_PROVIDER` | `interactive_browser` (default), `http_form`, or `fixtures` |
+| `CEM_ADAPTIVE_CONCURRENCY` / `CEM_MAX_CONCURRENCY` | Turn the controller on or off (`false` keeps `CEM_CONCURRENCY` fixed) and set its upper bound |
+| `CEM_PIPELINE_DEPTH` | Sessions open at once; `1` means strictly sequential |
 | `CEM_ACCEPT_EULA` | `false` by default. The tool never accepts the terms on your behalf unless you set this |
 | `CEM_BROWSER_CONTEXT_REQUESTS` | `true` sends HTTP requests through the authorized browser context instead of copying its cookies |
 | `CEM_SAVE_HTML_DIR` | Saves every fetched page with token-like inputs blanked; useful for building authentic fixtures |
@@ -216,7 +249,7 @@ These are soft issues: the question is stored with `validation_status = needs_re
 uv run pytest
 ```
 
-There are 89 tests: parser, models, HTTP client, access management, PostgreSQL, the orchestrator, and the browser provider. They need no network access, no CAPTCHA, and no paid services.
+There are 107 tests: parser, models, HTTP client, traffic control, access management, PostgreSQL, the orchestrator (including the session pipeline), and the browser provider. They need no network access, no CAPTCHA, and no paid services.
 
 - **PostgreSQL tests** start a throwaway embedded PostgreSQL 16 (`pgserver`). Alternatively, set `CEM_TEST_DATABASE_URL` to a **dedicated** database; its `public` schema gets wiped.
 - **Browser tests** run headless Chromium against a local stand-in server, not CEM. They're skipped if Playwright isn't installed.

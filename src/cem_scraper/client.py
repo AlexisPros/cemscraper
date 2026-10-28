@@ -29,6 +29,7 @@ from cem_scraper.config import EXAM_TYPE, QUESTION_PATH, Settings
 from cem_scraper.metrics import Metrics
 from cem_scraper.models import ExamSession
 from cem_scraper.parser import attr, decode_html
+from cem_scraper.throttle import TrafficControl
 
 log = logging.getLogger(__name__)
 
@@ -72,35 +73,6 @@ class PageResponse:
     elapsed: float
 
 
-class RateLimiter:
-    """Spaces request *starts* at least ``1 / rate`` seconds apart."""
-
-    def __init__(
-        self,
-        rate: float,
-        *,
-        clock: Callable[[], float] = time.monotonic,
-        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
-    ) -> None:
-        self._interval = 1.0 / rate
-        self._clock = clock
-        self._sleep = sleep
-        self._lock = asyncio.Lock()
-        self._next_slot = 0.0
-
-    def defer(self, seconds: float) -> None:
-        """Hold back *all* future request starts by ``seconds`` (the server asked us to wait)."""
-        self._next_slot = max(self._next_slot, self._clock() + seconds)
-
-    async def acquire(self) -> None:
-        async with self._lock:
-            now = self._clock()
-            wait = self._next_slot - now
-            self._next_slot = max(now, self._next_slot) + self._interval
-        if wait > 0:
-            await self._sleep(wait)
-
-
 def parse_retry_after(value: str | None, now: datetime | None = None) -> float | None:
     if not value:
         return None
@@ -130,27 +102,33 @@ def sanitize_snapshot(html: str) -> str:
 
 
 class CemClient:
+    """HTTP client for one authorized cookie jar.
+
+    All server-facing limits (request spacing, in-flight cap, circuit breaker)
+    come from ``traffic``, which a ``SessionManager`` shares between the clients
+    of a run. A standalone client gets its own.
+    """
+
     def __init__(
         self,
         settings: Settings,
         metrics: Metrics,
         *,
         transport: httpx.AsyncBaseTransport | None = None,
+        traffic: TrafficControl | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
-        rate_limiter: RateLimiter | None = None,
     ) -> None:
         self.settings = settings
         self.metrics = metrics
+        self.traffic = traffic or TrafficControl(settings, metrics, sleep=sleep)
         self._sleep = sleep
-        self._limiter = rate_limiter or RateLimiter(settings.requests_per_second, sleep=sleep)
-        self._semaphore = asyncio.Semaphore(settings.concurrency)
-        self._consecutive_failures = 0
-        self._breaker_open = False
         self._http = httpx.AsyncClient(
             base_url=settings.base_url,
             transport=transport,
             timeout=httpx.Timeout(settings.read_timeout, connect=settings.connect_timeout),
-            limits=httpx.Limits(max_connections=settings.concurrency, max_keepalive_connections=settings.concurrency),
+            limits=httpx.Limits(
+                max_connections=settings.max_concurrency, max_keepalive_connections=settings.max_concurrency
+            ),
             headers={"User-Agent": settings.effective_user_agent(), "Accept-Language": "pl,en;q=0.5"},
             follow_redirects=True,
         )
@@ -173,62 +151,68 @@ class CemClient:
         return random.uniform(0, cap)  # full jitter
 
     async def request(self, method: str, path: str, data: Mapping[str, str] | None = None) -> PageResponse:
-        if self._breaker_open:
+        breaker = self.traffic.breaker
+        if breaker.open:
             raise ServerUnavailable("circuit breaker open: too many consecutive server failures")
         last_error = "unknown error"
         for attempt in range(self.settings.max_retries + 1):
-            await self._limiter.acquire()
             delay: float | None = None
-            async with self._semaphore:
+            ticket = await self.traffic.concurrency.acquire()
+            latency: float | None = None
+            overloaded = False
+            try:
+                await self.traffic.limiter.acquire()
                 started = time.monotonic()
                 try:
                     response = await self._http.request(method, path, data=data)
                 except (httpx.TimeoutException, httpx.TransportError) as exc:
                     elapsed = time.monotonic() - started
+                    overloaded = True
                     self.metrics.record_request(elapsed, None, ok=False)
                     last_error = f"{type(exc).__name__} after {elapsed:.1f}s"
                     log.warning("%s %s failed (attempt %d): %s", method, path, attempt + 1, last_error)
                 else:
-                    elapsed = time.monotonic() - started
+                    latency = time.monotonic() - started
                     status = response.status_code
                     ok = 200 <= status < 300
-                    self.metrics.record_request(elapsed, status, ok=ok)
-                    log.debug("%s %s -> %d in %.2fs", method, path, status, elapsed)
+                    self.metrics.record_request(latency, status, ok=ok)
+                    log.debug("%s %s -> %d in %.2fs", method, path, status, latency)
                     if ok:
-                        self._consecutive_failures = 0
+                        breaker.success()
                         return PageResponse(
                             url=str(response.url),
                             status_code=status,
                             html=decode_html(response.content, response.charset_encoding),
-                            elapsed=elapsed,
+                            elapsed=latency,
                         )
                     if status in (401, 403):
                         raise AccessDenied(f"HTTP {status} for {path}")
                     if status not in RETRYABLE_STATUS:
                         raise UnexpectedStatus(status, path)
+                    overloaded = True
                     last_error = f"HTTP {status}"
                     delay = parse_retry_after(response.headers.get("Retry-After"))
                     if delay is not None and delay > self.settings.max_retry_after:
                         raise ServerThrottled(f"server asked to wait {delay:.0f}s (Retry-After) for {path}")
                     log.warning("%s %s -> HTTP %d (attempt %d)", method, path, status, attempt + 1)
+            finally:
+                self.traffic.concurrency.release(ticket, latency, overloaded=overloaded)
             if attempt == self.settings.max_retries:
                 break
             self.metrics.record_retry()
             if delay is not None:
-                # Retry-After applies to the whole client, not just this request:
-                # the limiter now holds back every request start, including this retry.
-                self._limiter.defer(delay)
+                # Retry-After applies to every client of the run, not just this request:
+                # the shared limiter now holds back every request start, including this retry.
+                self.traffic.limiter.defer(delay)
                 log.info("server asked to wait %.1fs; pausing all requests", delay)
             else:
                 wait = self._backoff(attempt)
                 log.info("retrying %s %s in %.1fs", method, path, wait)
                 await self._sleep(wait)
 
-        self._consecutive_failures += 1
-        if self._consecutive_failures >= self.settings.circuit_breaker_threshold:
-            self._breaker_open = True
+        if breaker.failure():
             raise ServerUnavailable(
-                f"{self._consecutive_failures} consecutive requests failed after retries; last: {last_error}"
+                f"{breaker.consecutive_failures} consecutive requests failed after retries; last: {last_error}"
             )
         raise RequestFailed(f"{method} {path} failed after {self.settings.max_retries + 1} attempts: {last_error}")
 

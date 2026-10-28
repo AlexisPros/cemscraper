@@ -12,7 +12,6 @@ import respx
 from cem_scraper.client import (
     AccessDenied,
     CemClient,
-    RateLimiter,
     RequestFailed,
     ServerThrottled,
     ServerUnavailable,
@@ -24,6 +23,7 @@ from cem_scraper.config import Settings
 from cem_scraper.logging_config import RedactingFilter, redact
 from cem_scraper.metrics import Metrics
 from cem_scraper.models import ExamSession
+from cem_scraper.throttle import RateLimiter, TrafficControl
 
 QUESTION_URL = "https://www.cem.edu.pl/pytcem/wyswietl_pytania_pes.php"
 
@@ -51,8 +51,8 @@ def client_factory(settings: Settings, sleep: FakeSleep, limiter_sleep: FakeSlee
     def make(**overrides: object) -> CemClient:
         s = settings.model_copy(update=overrides)
         # Backoff sleeps (``sleep``) are recorded separately from request spacing (``limiter_sleep``).
-        limiter = RateLimiter(1000, sleep=limiter_sleep)
-        return CemClient(s, Metrics(), sleep=sleep, rate_limiter=limiter)
+        traffic = TrafficControl(s, limiter=RateLimiter(1000, sleep=limiter_sleep))
+        return CemClient(s, Metrics(), sleep=sleep, traffic=traffic)
 
     return make
 
@@ -185,8 +185,9 @@ async def test_concurrency_is_capped(settings: Settings) -> None:
         active -= 1
         return httpx.Response(200)
 
-    s = settings.model_copy(update={"concurrency": 2})
-    client = CemClient(s, Metrics(), transport=httpx.MockTransport(handler), rate_limiter=RateLimiter(1000))
+    s = settings.model_copy(update={"concurrency": 2, "adaptive_concurrency": False})
+    traffic = TrafficControl(s, limiter=RateLimiter(1000))
+    client = CemClient(s, Metrics(), transport=httpx.MockTransport(handler), traffic=traffic)
     await asyncio.gather(*(client.get("x") for _ in range(6)))
     await client.aclose()
     assert peak == 2

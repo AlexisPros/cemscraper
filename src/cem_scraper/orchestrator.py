@@ -1,10 +1,18 @@
-"""Collection orchestrator: session iteration, question discovery, resume, failure handling.
+"""Collection orchestrator: session pipeline, question discovery, resume, failure handling.
 
-Discovery: questions are requested from 1 upwards in batches of
-``concurrency``. Collection of a session ends after ``missing_streak_to_stop``
-consecutive *missing* questions past the highest question found (gaps inside
-the range are recorded as missing and do not stop collection), or when the page
-reports a total ("Pytanie nr N z T") and T has been passed.
+Sessions: up to ``pipeline_depth`` examination sessions are open at once. Their
+authorizations are serialized by the ``SessionManager``, so while session N is
+being collected the next session is already being authorized (the user solves
+its CAPTCHA meanwhile) and its grant is used as soon as it exists. All sessions
+share one ``TrafficControl``: parallel sessions never raise the request rate.
+
+Questions: numbers are dispatched from 1 upwards through a sliding window of
+in-flight requests (the adaptive concurrency limit), so one slow response does
+not hold back the others. Outcomes are folded in question order: collection of
+a session ends after ``missing_streak_to_stop`` consecutive *missing* questions
+past the highest question found (gaps inside the range are recorded as missing
+and do not stop collection), or when the page reports a total ("Pytanie nr N z T")
+and T has been passed.
 
 Every question gets a persisted attempt status, so a restart skips stored
 questions and retries only failed or unknown ones.
@@ -13,7 +21,9 @@ questions and retries only failed or unknown ones.
 from __future__ import annotations
 
 import asyncio
+import heapq
 import logging
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from enum import StrEnum
 
@@ -36,7 +46,7 @@ from cem_scraper.parser import (
     UnexpectedContent,
     parse_question_page,
 )
-from cem_scraper.session_manager import AccessBlocked, AuthorizedSession, SessionManager
+from cem_scraper.session_manager import AccessBlocked, AuthorizedSession, OpenCancelled, SessionManager
 
 log = logging.getLogger(__name__)
 
@@ -63,6 +73,7 @@ class SessionOutcome(StrEnum):
     INCOMPLETE = "incomplete"  # finished, but some questions failed: rerun to retry them
     BLOCKED = "blocked"  # authorization unavailable/expired: stop the run
     ABORTED = "aborted"  # server signalled trouble: stop the run
+    NOT_STARTED = "not_started"  # the run stopped before this session was authorized
 
 
 @dataclass
@@ -107,31 +118,38 @@ class Orchestrator:
 
     async def run(self, session_codes: list[str], *, refetch: bool = False, only_failed: bool = False) -> RunReport:
         run_id = await self.repo.start_run(session_codes, self.sessions.provider.name)
-        log.info("run %s started for %d session(s)", run_id, len(session_codes))
-        reports: list[SessionReport] = []
+        log.info(
+            "run %s started for %d session(s), up to %d at a time",
+            run_id,
+            len(session_codes),
+            self.settings.pipeline_depth,
+        )
+        tasks: dict[str, asyncio.Task[SessionReport]] = {}
+        reports: dict[str, SessionReport] = {}
+        slots = asyncio.Semaphore(self.settings.pipeline_depth)
+        stop = asyncio.Event()
         status = RunStatus.COMPLETED
         try:
             for code in session_codes:
+                await slots.acquire()
+                if stop.is_set():
+                    slots.release()
+                    break
                 session = ExamSession.from_code(code, self.settings.specialization_code)
-                report = await self.scrape_session(session, run_id, refetch=refetch, only_failed=only_failed)
-                reports.append(report)
-                log.info(
-                    "%s: %s (stored=%d, missing=%d, failed=%d) | %s",
-                    session.label,
-                    report.outcome.value,
-                    report.stored,
-                    len(report.missing),
-                    len(report.failed),
-                    self.metrics.summary_line(),
+                tasks[code] = asyncio.create_task(
+                    self._session_worker(session, run_id, slots, stop, tasks, refetch=refetch, only_failed=only_failed),
+                    name=f"session-{code}",
                 )
-                if report.outcome is SessionOutcome.BLOCKED:
-                    status = RunStatus.BLOCKED
-                    break
-                if report.outcome is SessionOutcome.ABORTED:
-                    status = RunStatus.FAILED
-                    break
-                if report.outcome is SessionOutcome.INCOMPLETE:
-                    status = RunStatus.PARTIAL
+            results = await asyncio.gather(*tasks.values(), return_exceptions=True)
+            for code, result in zip(tasks, results, strict=True):
+                if isinstance(result, SessionReport):
+                    reports[code] = result
+                elif isinstance(result, asyncio.CancelledError):
+                    message = "stopped because another session hit a server failure; rerun to resume"
+                    reports[code] = SessionReport(code, SessionOutcome.ABORTED, error=message)
+                else:
+                    raise result
+            status = self._run_status(reports.values())
         except asyncio.CancelledError:
             status = RunStatus.INTERRUPTED
             log.warning("run interrupted; progress is saved, rerun to resume")
@@ -140,23 +158,86 @@ class Orchestrator:
             status = RunStatus.FAILED
             raise
         finally:
+            for task in tasks.values():
+                task.cancel()
+            await asyncio.gather(*tasks.values(), return_exceptions=True)
+            for code, task in tasks.items():
+                if code not in reports and not task.cancelled() and task.exception() is None:
+                    reports[code] = task.result()  # finished before an interruption
             self.metrics.stop()
             snapshot = self.metrics.snapshot()
             snapshot["sessions"] = {
-                r.session_code: {
+                code: {
                     "outcome": r.outcome.value,
                     "discovered": r.discovered_question_count,
                     "missing": r.missing,
                     "failed": {str(k): v for k, v in r.failed.items()},
                     "error": r.error,
                 }
-                for r in reports
+                for code, r in reports.items()
             }
             await asyncio.shield(self.repo.finish_run(run_id, status, snapshot))
-        return RunReport(run_id=str(run_id), status=status, sessions=reports, metrics=snapshot)
+        ordered = [reports[code] for code in session_codes if code in reports]
+        return RunReport(run_id=str(run_id), status=status, sessions=ordered, metrics=snapshot)
+
+    async def _session_worker(
+        self,
+        session: ExamSession,
+        run_id: object,
+        slots: asyncio.Semaphore,
+        stop: asyncio.Event,
+        siblings: dict[str, asyncio.Task[SessionReport]],
+        *,
+        refetch: bool,
+        only_failed: bool,
+    ) -> SessionReport:
+        try:
+            report = await self.scrape_session(
+                session, run_id, refetch=refetch, only_failed=only_failed, abort_if=stop.is_set
+            )
+        except BaseException:
+            stop.set()
+            raise
+        finally:
+            slots.release()
+        log.info(
+            "%s: %s (stored=%d, missing=%d, failed=%d) | %s",
+            session.label,
+            report.outcome.value,
+            report.stored,
+            len(report.missing),
+            len(report.failed),
+            self.metrics.summary_line(),
+        )
+        if report.outcome in (SessionOutcome.BLOCKED, SessionOutcome.ABORTED):
+            stop.set()  # launch no further sessions; authorizations not yet started are skipped
+        if report.outcome is SessionOutcome.ABORTED:
+            # The server is in trouble: stop every session now instead of letting them finish.
+            current = asyncio.current_task()
+            for task in siblings.values():
+                if task is not current:
+                    task.cancel()
+        return report
+
+    @staticmethod
+    def _run_status(reports: Iterable[SessionReport]) -> RunStatus:
+        outcomes = {r.outcome for r in reports}
+        if SessionOutcome.ABORTED in outcomes:
+            return RunStatus.FAILED
+        if SessionOutcome.BLOCKED in outcomes:
+            return RunStatus.BLOCKED
+        if SessionOutcome.INCOMPLETE in outcomes:
+            return RunStatus.PARTIAL
+        return RunStatus.COMPLETED
 
     async def scrape_session(
-        self, session: ExamSession, run_id: object, *, refetch: bool = False, only_failed: bool = False
+        self,
+        session: ExamSession,
+        run_id: object,
+        *,
+        refetch: bool = False,
+        only_failed: bool = False,
+        abort_if: Callable[[], bool] | None = None,
     ) -> SessionReport:
         state = await self.repo.ensure_session(session)
         report = SessionReport(session_code=session.session_code, outcome=SessionOutcome.COMPLETED)
@@ -177,21 +258,23 @@ class Orchestrator:
                 report.outcome = SessionOutcome.SKIPPED
                 return report
 
-        await self.repo.set_session_status(state.id, CollectionStatus.IN_PROGRESS)
         try:
-            auth = await self.sessions.open(session)
+            auth = await self.sessions.open(session, abort_if=abort_if)
+        except OpenCancelled as exc:
+            report.outcome, report.error = SessionOutcome.NOT_STARTED, str(exc)
+            return report
         except AccessBlocked as exc:
             log.error("%s: access blocked: %s", session.label, exc)
             await self.repo.set_session_status(state.id, CollectionStatus.BLOCKED, last_error=str(exc))
             report.outcome, report.error = SessionOutcome.BLOCKED, str(exc)
             return report
+        await self.repo.set_session_status(state.id, CollectionStatus.IN_PROGRESS)
 
         try:
+            candidates = todo if only_failed else None
+            auth, highest = await self._collect(auth, state.id, run_id, report, done, candidates=candidates)
             if only_failed:
-                auth = await self._process_numbers(auth, state.id, run_id, todo, report, done)
                 highest = state.discovered_question_count or 0  # refined below from stored statuses
-            else:
-                auth, highest = await self._discover(auth, state.id, run_id, report, done)
         except _StopRun as stop:
             final = CollectionStatus.BLOCKED if stop.outcome is SessionOutcome.BLOCKED else CollectionStatus.FAILED
             await self.repo.set_session_status(state.id, final, last_error=str(stop))
@@ -225,103 +308,129 @@ class Orchestrator:
             await self.repo.set_session_status(state.id, CollectionStatus.COMPLETED, discovered_question_count=highest)
         return report
 
-    # ------------------------------------------------------------------ discovery
+    # ------------------------------------------------------------------ question engine
 
-    async def _discover(
-        self, auth: AuthorizedSession, session_id: int, run_id: object, report: SessionReport, done: set[int]
-    ) -> tuple[AuthorizedSession, int]:
-        settings = self.settings
-        limit = settings.max_question_number
-        highest = max(done, default=0)
-        streak = 0
-        number = 1
-
-        # The page returned by the official form submission is question 1: use it, no extra request.
-        if auth.grant.first_page_html and 1 not in done:
-            result = await self._handle_html(auth, session_id, run_id, 1, auth.grant.first_page_html)
-            auth = await self._after_batch(auth, session_id, run_id, [result], done)
-            if result.status is AttemptStatus.STORED:
-                done.add(1)
-
-        while number <= limit:
-            batch: list[int] = []
-            while len(batch) < settings.concurrency and number <= limit:
-                if number in done:
-                    highest, streak = max(highest, number), 0
-                else:
-                    batch.append(number)
-                number += 1
-            if not batch:
-                continue
-            results = await self._fetch_batch(auth, session_id, run_id, batch)
-            auth = await self._after_batch(auth, session_id, run_id, results, done)
-            retry_from: int | None = None
-            for result in sorted(results, key=lambda r: r.number):
-                self._collect(report, result)
-                if result.status is AttemptStatus.STORED:
-                    done.add(result.number)
-                    highest, streak = max(highest, result.number), 0
-                    if result.reported_total:
-                        limit = min(limit, result.reported_total + settings.missing_streak_to_stop)
-                elif result.status is AttemptStatus.MISSING:
-                    streak += 1
-                elif result.status is AttemptStatus.AUTH_ERROR:
-                    retry_from = result.number if retry_from is None else min(retry_from, result.number)
-                elif result.status is not AttemptStatus.SERVER_ERROR:
-                    # Content was there but unusable: the question exists.
-                    highest, streak = max(highest, result.number), 0
-            if retry_from is not None:  # re-authorized: fetch those numbers again
-                number = retry_from
-                continue
-            if streak >= settings.missing_streak_to_stop and number - 1 > highest:
-                log.info("%s: end of questions after %d (missing streak %d)", auth.session.label, highest, streak)
-                break
-        else:
-            if limit == settings.max_question_number:
-                log.warning("%s: reached max question number %d without finding the end", auth.session.label, limit)
-        return auth, highest
-
-    async def _process_numbers(
+    async def _collect(
         self,
         auth: AuthorizedSession,
         session_id: int,
         run_id: object,
-        numbers: list[int],
         report: SessionReport,
         done: set[int],
-    ) -> AuthorizedSession:
-        queue = list(numbers)
-        while queue:
-            batch, queue = queue[: self.settings.concurrency], queue[self.settings.concurrency :]
-            results = await self._fetch_batch(auth, session_id, run_id, batch)
-            auth = await self._after_batch(auth, session_id, run_id, results, done)
-            for result in results:
-                self._collect(report, result)
-                if result.status is AttemptStatus.STORED:
-                    done.add(result.number)
-                elif result.status is AttemptStatus.AUTH_ERROR:
-                    queue.insert(0, result.number)
-        return auth
+        *,
+        candidates: list[int] | None = None,
+    ) -> tuple[AuthorizedSession, int]:
+        """Fetch questions through a sliding window of in-flight requests.
+
+        ``candidates=None`` means discovery (1, 2, ... until the end is detected);
+        otherwise exactly those numbers are fetched (``--retry-failed``).
+        """
+        settings = self.settings
+        discovery = candidates is None
+        pending = iter(candidates or [])
+        limit = settings.max_question_number
+        highest = max(done, default=0)
+        streak = 0
+        frontier = 1  # discovery: next number whose outcome is folded into the streak
+        next_number = 1
+        stopped = False
+        outcomes: dict[int, AttemptStatus] = {}
+        retry: list[int] = []  # heap: numbers to fetch again after re-authorization
+        in_flight: dict[asyncio.Task[QuestionResult], int] = {}
+        auth_failures: list[QuestionResult] = []
+
+        def take_number() -> int | None:
+            nonlocal next_number
+            if retry:
+                return heapq.heappop(retry)
+            if not discovery:
+                return next(pending, None)
+            if stopped:
+                return None
+            while next_number <= limit and next_number in done:
+                next_number += 1
+            if next_number > limit:
+                return None
+            next_number += 1
+            return next_number - 1
+
+        def fold() -> None:
+            nonlocal frontier, highest, streak, stopped
+            while not stopped:
+                if frontier in done:
+                    status = AttemptStatus.STORED
+                elif frontier in outcomes:
+                    status = outcomes[frontier]
+                else:
+                    return  # still in flight (or waiting for a retry)
+                if status in EXISTING_STATUSES:
+                    highest, streak = max(highest, frontier), 0
+                elif status is AttemptStatus.MISSING:
+                    streak += 1
+                # SERVER_ERROR: unknown whether the question exists; the streak is unchanged.
+                frontier += 1
+                if streak >= settings.missing_streak_to_stop and frontier - 1 > highest:
+                    stopped = True
+                    log.info("%s: end of questions after %d (missing streak %d)", auth.session.label, highest, streak)
+
+        def absorb(result: QuestionResult) -> None:
+            nonlocal limit
+            self._note_result(report, result)
+            if result.status is AttemptStatus.AUTH_ERROR:
+                auth_failures.append(result)
+                return
+            outcomes[result.number] = result.status
+            if result.status is AttemptStatus.STORED:
+                done.add(result.number)
+                if result.reported_total:
+                    limit = min(limit, result.reported_total + settings.missing_streak_to_stop)
+
+        # The page returned by the official form submission is question 1: use it, no extra request.
+        if auth.grant.first_page_html and 1 not in done and discovery:
+            absorb(await self._handle_html(auth, session_id, run_id, 1, auth.grant.first_page_html))
+
+        try:
+            while True:
+                if auth_failures and not in_flight:
+                    auth = await self._resolve_auth_failures(auth, session_id, run_id, auth_failures, done)
+                    for failure in auth_failures:
+                        if failure.status is AttemptStatus.MISSING:
+                            outcomes[failure.number] = AttemptStatus.MISSING
+                        else:  # re-authorized: fetch it again with the new grant
+                            heapq.heappush(retry, failure.number)
+                    auth_failures.clear()
+                if discovery:
+                    fold()
+                # Dispatch nothing while authorization is in doubt; otherwise fill the window.
+                while not auth_failures and len(in_flight) < self.sessions.traffic.concurrency.limit:
+                    number = take_number()
+                    if number is None:
+                        break
+                    task = asyncio.create_task(self._fetch_one(auth, session_id, run_id, number))
+                    in_flight[task] = number
+                if not in_flight and not auth_failures:
+                    break
+                if in_flight:
+                    finished, _ = await asyncio.wait(in_flight, return_when=asyncio.FIRST_COMPLETED)
+                    for task in finished:
+                        del in_flight[task]
+                        absorb(task.result())  # re-raises _StopRun and unexpected errors
+        finally:
+            for task in in_flight:
+                task.cancel()
+            if in_flight:
+                await asyncio.gather(*in_flight, return_exceptions=True)
+
+        if discovery and not stopped and limit == settings.max_question_number:
+            log.warning("%s: reached max question number %d without finding the end", auth.session.label, limit)
+        return auth, highest
 
     @staticmethod
-    def _collect(report: SessionReport, result: QuestionResult) -> None:
+    def _note_result(report: SessionReport, result: QuestionResult) -> None:
         if result.status in FAILURE_STATUSES and result.status is not AttemptStatus.AUTH_ERROR:
             report.failed[result.number] = f"{result.status.value}: {result.error}"
         elif result.status is AttemptStatus.STORED:
             report.failed.pop(result.number, None)
-
-    async def _fetch_batch(
-        self, auth: AuthorizedSession, session_id: int, run_id: object, numbers: list[int]
-    ) -> list[QuestionResult]:
-        try:
-            async with asyncio.TaskGroup() as group:
-                tasks = [group.create_task(self._fetch_one(auth, session_id, run_id, n)) for n in numbers]
-        except BaseExceptionGroup as group_error:
-            stops = [e for e in group_error.exceptions if isinstance(e, _StopRun)]
-            if stops:
-                raise stops[0] from None
-            raise
-        return [task.result() for task in tasks]
 
     async def _fetch_one(self, auth: AuthorizedSession, session_id: int, run_id: object, number: int) -> QuestionResult:
         code = auth.session.session_code
@@ -376,12 +485,12 @@ class Orchestrator:
             log.warning("%s q%d: %s (%s)", code, result.number, result.status.value, result.error)
         return result
 
-    async def _after_batch(
+    async def _resolve_auth_failures(
         self,
         auth: AuthorizedSession,
         session_id: int,
         run_id: object,
-        results: list[QuestionResult],
+        auth_failures: list[QuestionResult],
         done: set[int],
     ) -> AuthorizedSession:
         """Distinguish 'out-of-range question' from 'authorization expired' and act on it.
@@ -391,9 +500,6 @@ class Orchestrator:
         does not exist (recorded as missing). Otherwise authorization is gone:
         re-authorize within limits or stop.
         """
-        auth_failures = [r for r in results if r.status is AttemptStatus.AUTH_ERROR]
-        if not auth_failures:
-            return auth
         if done and await self._probe(auth, min(done)):
             for r in auth_failures:
                 r.status, r.error = AttemptStatus.MISSING, "server returned the entry form; session still valid"
