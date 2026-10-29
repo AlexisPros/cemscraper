@@ -336,7 +336,10 @@ The defaults are conservative: **0.5 requests/s; 2 requests in flight, adaptive 
 2 sessions in the pipeline, a 45 s read
 timeout (CEM sometimes takes about 10 s), 4 retries with full-jitter exponential
 backoff, `Retry-After` honored up to 300 s (anything longer stops the run), and a
-circuit breaker after 5 consecutive failed requests. The validator caps concurrency
+circuit breaker after 5 consecutive failed requests. A timeout, 429 or 5xx pauses every
+request on that lane for `CEM_OVERLOAD_PAUSE` (30 s), and a lane with no successful
+response for `CEM_STALL_TIMEOUT` (180 s) stops the run instead of retrying into a
+server that has stopped answering. Warnings name the lane (`direct`, `proxy1 ...`). The validator caps concurrency
 at 16 and the rate at 5 req/s.
 
 | Setting | Meaning |

@@ -164,10 +164,11 @@ class CemClient:
         """Send with retries. ``retries=0`` for requests that must not be repeated (a CAPTCHA token)."""
         max_retries = self.settings.max_retries if retries is None else retries
         breaker = self.traffic.breaker
-        if breaker.open:
-            raise ServerUnavailable("circuit breaker open: too many consecutive server failures")
+        lane = self.traffic.name
         last_error = "unknown error"
         for attempt in range(max_retries + 1):
+            if breaker.open:
+                raise ServerUnavailable(f"circuit breaker open on lane {lane}: the server keeps failing")
             delay: float | None = None
             ticket = await self.traffic.concurrency.acquire()
             latency: float | None = None
@@ -182,7 +183,7 @@ class CemClient:
                     overloaded = True
                     self.metrics.record_request(elapsed, None, ok=False, lane=self.traffic.name)
                     last_error = f"{type(exc).__name__} after {elapsed:.1f}s"
-                    log.warning("%s %s failed (attempt %d): %s", method, path, attempt + 1, last_error)
+                    log.warning("%s %s failed (lane %s, attempt %d): %s", method, path, lane, attempt + 1, last_error)
                 else:
                     latency = time.monotonic() - started
                     status = response.status_code
@@ -206,9 +207,13 @@ class CemClient:
                     delay = parse_retry_after(response.headers.get("Retry-After"))
                     if delay is not None and delay > self.settings.max_retry_after:
                         raise ServerThrottled(f"server asked to wait {delay:.0f}s (Retry-After) for {path}")
-                    log.warning("%s %s -> HTTP %d (attempt %d)", method, path, status, attempt + 1)
+                    log.warning("%s %s -> HTTP %d (lane %s, attempt %d)", method, path, status, lane, attempt + 1)
             finally:
                 self.traffic.concurrency.release(ticket, latency, overloaded=overloaded)
+            if overloaded and breaker.attempt_failed():
+                raise ServerUnavailable(
+                    f"lane {lane}: no successful response for {breaker.stall_timeout:.0f}s; last: {last_error}"
+                )
             if attempt == max_retries:
                 break
             self.metrics.record_retry()
@@ -218,6 +223,10 @@ class CemClient:
                 self.traffic.limiter.defer(delay)
                 log.info("server asked to wait %.1fs; pausing all requests", delay)
             else:
+                # The server is struggling: hold back every request on this lane, not just this one.
+                pause = self.settings.overload_pause if overloaded else 0.0
+                if pause > 0 and self.traffic.limiter.defer(pause):
+                    log.warning("lane %s: server overloaded; pausing it for %.0fs", lane, pause)
                 wait = self._backoff(attempt)
                 log.info("retrying %s %s in %.1fs", method, path, wait)
                 await self._sleep(wait)

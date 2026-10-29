@@ -84,6 +84,11 @@ class Settings(BaseSettings):
     backoff_max: float = Field(default=60.0, gt=0)
     max_retry_after: float = Field(default=300.0, gt=0)
     circuit_breaker_threshold: int = Field(default=5, ge=1)
+    # A timeout, 429 or 5xx pauses every request start on that lane (IP) for this long:
+    # an overloaded server needs air, not retries 1 s later.
+    overload_pause: float = Field(default=30.0, ge=0)
+    # Stop the run when a lane has had failures and no successful response for this long.
+    stall_timeout: float = Field(default=180.0, gt=0)
 
     # Discovery
     target_sessions: Annotated[list[str], NoDecode] = Field(default_factory=default_target_sessions)

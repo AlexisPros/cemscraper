@@ -23,7 +23,7 @@ from cem_scraper.config import Settings
 from cem_scraper.logging_config import RedactingFilter, redact
 from cem_scraper.metrics import Metrics
 from cem_scraper.models import ExamSession
-from cem_scraper.throttle import RateLimiter, TrafficControl
+from cem_scraper.throttle import CircuitBreaker, RateLimiter, TrafficControl
 
 QUESTION_URL = "https://www.cem.edu.pl/pytcem/wyswietl_pytania_pes.php"
 
@@ -147,6 +147,51 @@ async def test_success_resets_failure_counter(client_factory) -> None:
     await client.post("wyswietl_pytania_pes.php", {})
     with pytest.raises(RequestFailed):  # not ServerUnavailable: the counter was reset
         await client.post("wyswietl_pytania_pes.php", {})
+
+
+@respx.mock
+async def test_overload_pauses_the_whole_lane(
+    client_factory, limiter_sleep: FakeSleep, caplog: pytest.LogCaptureFixture
+) -> None:
+    respx.post(QUESTION_URL).mock(side_effect=[httpx.ReadTimeout("t"), httpx.Response(503), httpx.Response(200)])
+    client = client_factory(overload_pause=30)
+    await client.post("wyswietl_pytania_pes.php", {})
+    # Every retry (and every other request of the lane) starts only after the pause.
+    assert len([s for s in limiter_sleep.calls if s > 29]) == 2
+    assert caplog.text.count("pausing it for 30s") == 1  # logged once per pause, not per request
+
+
+@respx.mock
+async def test_stalled_lane_stops_without_exhausting_retries(client_factory) -> None:
+    now = [0.0]
+
+    def timeout(_: httpx.Request) -> httpx.Response:
+        now[0] += 45  # each attempt hangs for the whole read timeout
+        raise httpx.ReadTimeout("t")
+
+    route = respx.post(QUESTION_URL).mock(side_effect=timeout)
+    client = client_factory(max_retries=10)
+    client.traffic.breaker = CircuitBreaker(5, stall_timeout=180, clock=lambda: now[0])
+    with pytest.raises(ServerUnavailable, match="lane direct: no successful response for 180s"):
+        await client.post("wyswietl_pytania_pes.php", {})
+    assert route.call_count == 5  # 45 s .. 225 s; not 11 attempts
+    with pytest.raises(ServerUnavailable, match="circuit breaker open on lane direct"):
+        await client.post("wyswietl_pytania_pes.php", {})
+    assert route.call_count == 5
+
+
+def test_a_success_restarts_the_stall_clock() -> None:
+    now = [0.0]
+    breaker = CircuitBreaker(5, stall_timeout=180, clock=lambda: now[0])
+    assert not breaker.attempt_failed()
+    now[0] = 170
+    breaker.success()
+    now[0] = 200
+    assert not breaker.attempt_failed()  # failing since 200, not since 0
+    now[0] = 379
+    assert not breaker.attempt_failed()
+    now[0] = 380
+    assert breaker.attempt_failed() and breaker.open
 
 
 @respx.mock

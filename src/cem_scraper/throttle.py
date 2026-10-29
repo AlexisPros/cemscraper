@@ -43,9 +43,12 @@ class RateLimiter:
         self._lock = asyncio.Lock()
         self._next_slot = 0.0
 
-    def defer(self, seconds: float) -> None:
-        """Hold back *all* future request starts by ``seconds`` (the server asked us to wait)."""
-        self._next_slot = max(self._next_slot, self._clock() + seconds)
+    def defer(self, seconds: float) -> bool:
+        """Hold back *all* future request starts by ``seconds``; True if no pause was pending yet."""
+        now = self._clock()
+        fresh = self._next_slot - now <= self._interval
+        self._next_slot = max(self._next_slot, now + seconds)
+        return fresh
 
     async def idle(self) -> None:
         """Wait out a pending deferral (e.g. Retry-After) without reserving a slot.
@@ -196,15 +199,35 @@ class AdaptiveConcurrency:
 
 
 class CircuitBreaker:
-    """Opens after ``threshold`` consecutive requests failed even after retries."""
+    """Opens after ``threshold`` consecutive requests failed even after retries,
+    or when attempts kept failing for ``stall_timeout`` seconds without one success.
 
-    def __init__(self, threshold: int) -> None:
+    The second rule matters when the server stops answering: with 45 s read
+    timeouts and several retries per request, five *exhausted* requests take minutes.
+    """
+
+    def __init__(
+        self, threshold: int, stall_timeout: float = float("inf"), *, clock: Callable[[], float] = time.monotonic
+    ) -> None:
         self.threshold = threshold
+        self.stall_timeout = stall_timeout
         self.consecutive_failures = 0
+        self.failing_since: float | None = None
         self.open = False
+        self._clock = clock
 
     def success(self) -> None:
         self.consecutive_failures = 0
+        self.failing_since = None
+
+    def attempt_failed(self) -> bool:
+        """Record one failed attempt; returns True when the lane has been stalled too long."""
+        now = self._clock()
+        if self.failing_since is None:
+            self.failing_since = now
+        elif now - self.failing_since >= self.stall_timeout:
+            self.open = True
+        return self.open
 
     def failure(self) -> bool:
         """Record a failure; returns True when the breaker is (now) open."""
@@ -239,4 +262,4 @@ class TrafficControl:
             latency_tolerance=settings.latency_tolerance,
             on_change=metrics.record_concurrency_change if metrics else None,
         )
-        self.breaker = CircuitBreaker(settings.circuit_breaker_threshold)
+        self.breaker = CircuitBreaker(settings.circuit_breaker_threshold, settings.stall_timeout)

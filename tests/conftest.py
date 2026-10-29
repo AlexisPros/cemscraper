@@ -42,6 +42,7 @@ def settings(tmp_path: Path) -> Settings:
         backoff_max=0.02,
         output_dir=tmp_path / "out",
         max_question_number=30,
+        overload_pause=0,
     )
 
 
