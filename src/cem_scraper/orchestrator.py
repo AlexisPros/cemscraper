@@ -1,10 +1,11 @@
 """Collection orchestrator: session pipeline, question discovery, resume, failure handling.
 
-Sessions: up to ``pipeline_depth`` examination sessions are open at once. Their
-authorizations are serialized by the ``SessionManager``, so while session N is
-being collected the next session is already being authorized (the user solves
-its CAPTCHA meanwhile) and its grant is used as soon as it exists. All sessions
-share one ``TrafficControl``: parallel sessions never raise the request rate.
+Sessions: up to ``pipeline_depth`` examination sessions per lane (exit IP) are
+open at once. Authorizations are serialized per lane by the ``SessionManager``,
+so while session N is being collected the next session is already being
+authorized (its CAPTCHA is solved meanwhile) and its grant is used as soon as it
+exists. Sessions of one lane share its ``TrafficControl``: parallel sessions
+never raise one IP's request rate.
 
 Questions: numbers are dispatched from 1 upwards through a sliding window of
 in-flight requests (the adaptive concurrency limit), so one slow response does
@@ -134,15 +135,18 @@ class Orchestrator:
 
     async def run(self, session_codes: list[str], *, refetch: bool = False, only_failed: bool = False) -> RunReport:
         run_id = await self.repo.start_run(session_codes, self.sessions.provider.name)
+        lanes = self.sessions.lanes
         log.info(
-            "run %s started for %d session(s), up to %d at a time",
+            "run %s started for %d session(s), up to %d at a time over %d lane(s): %s",
             run_id,
             len(session_codes),
-            self.settings.pipeline_depth,
+            self.settings.pipeline_depth * len(lanes),
+            len(lanes),
+            ", ".join(lane.name for lane in lanes),
         )
         tasks: dict[str, asyncio.Task[SessionReport]] = {}
         reports: dict[str, SessionReport] = {}
-        slots = asyncio.Semaphore(self.settings.pipeline_depth)
+        slots = asyncio.Semaphore(self.settings.pipeline_depth * len(lanes))
         stop = asyncio.Event()
         status = RunStatus.COMPLETED
         try:
@@ -511,7 +515,7 @@ class Orchestrator:
                 if discovery:
                     fold()
                 # Dispatch nothing while authorization is in doubt; otherwise fill the window.
-                while not auth_failures and len(in_flight) < self.sessions.traffic.concurrency.limit:
+                while not auth_failures and len(in_flight) < auth.client.traffic.concurrency.limit:
                     number = take_number()
                     if number is None:
                         break

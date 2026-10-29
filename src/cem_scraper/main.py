@@ -9,7 +9,7 @@ import logging
 import sys
 from decimal import Decimal
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from pydantic import ValidationError
 
@@ -165,6 +165,13 @@ def _print_report(report: RunReport) -> None:
 
     if m.get("captcha_solves"):
         print(f"  captcha: {m['captcha_solves']} solved, cost {m['captcha_cost']:.4f} (2Captcha account currency)")
+    lanes = cast(dict[str, dict[str, Any]], m.get("lanes") or {})
+    if len(lanes) > 1:
+        for name, lane in lanes.items():
+            print(
+                f"  lane {name}: requests={lane['requests']} failed={lane['failures']} "
+                f"median={lane['duration_median_s']}s"
+            )
     print(
         f"  requests={m['requests']} ok={m['request_successes']} failed={m['request_failures']} "
         f"retries={m['retries']} avg={secs('duration_avg_s')} median={secs('duration_median_s')} "

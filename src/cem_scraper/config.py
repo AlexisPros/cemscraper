@@ -10,6 +10,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Annotated
 
+import httpx
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
@@ -48,7 +49,14 @@ class CaptchaProviderName(StrEnum):
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix="CEM_", env_file=".env", env_file_encoding="utf-8", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_prefix="CEM_",
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+        # Validation errors must not print raw values: they may be proxy passwords or API keys.
+        hide_input_in_errors=True,
+    )
 
     database_url: SecretStr = SecretStr("postgresql://cem:cem_local_dev@localhost:5432/cem")
 
@@ -63,6 +71,12 @@ class Settings(BaseSettings):
     adaptive_concurrency: bool = True
     latency_tolerance: float = Field(default=1.5, gt=1)
     requests_per_second: float = Field(default=0.5, gt=0, le=5)
+    # Extra exit IPs (e.g. 2Captcha residential proxies), comma-separated http://user:pass@host:port.
+    # Each proxy is a separate *lane*: its own CEM session, CAPTCHA, rate limit and concurrency.
+    # Use only with the site operator's permission; requires CEM_ACCESS_PROVIDER=http_form.
+    proxy_urls: Annotated[list[SecretStr], NoDecode] = Field(default_factory=list)
+    # Also collect through this machine's own IP, next to the proxies.
+    proxy_include_direct: bool = True
     connect_timeout: float = Field(default=10.0, gt=0)
     read_timeout: float = Field(default=45.0, gt=0)
     max_retries: int = Field(default=4, ge=0, le=10)
@@ -120,7 +134,7 @@ class Settings(BaseSettings):
         # `CEM_CHROME_PATH=` in .env would otherwise become Path(".")
         return None if isinstance(value, str) and not value.strip() else value
 
-    @field_validator("target_sessions", "chrome_extra_args", mode="before")
+    @field_validator("target_sessions", "chrome_extra_args", "proxy_urls", mode="before")
     @classmethod
     def _split_sessions(cls, value: object) -> object:
         if isinstance(value, str):
@@ -133,10 +147,35 @@ class Settings(BaseSettings):
             raise ValueError(f"max_concurrency ({self.max_concurrency}) < concurrency ({self.concurrency})")
         return self
 
+    @model_validator(mode="after")
+    def _proxy_lanes(self) -> Settings:
+        for index, secret in enumerate(self.proxy_urls, 1):
+            try:
+                url = httpx.URL(secret.get_secret_value())
+            except httpx.InvalidURL:
+                url = None
+            if url is None or url.scheme not in ("http", "https") or not url.host or not url.port:
+                # Never echo the value: it carries the proxy password.
+                raise ValueError(f"CEM_PROXY_URLS entry {index} must look like http://user:pass@host:port")
+        if self.proxy_urls and self.access_provider not in (AccessProviderName.HTTP_FORM, AccessProviderName.FIXTURES):
+            # A browser authorizes from this machine's IP; its cookie would then be used from another IP.
+            raise ValueError("CEM_PROXY_URLS works only with CEM_ACCESS_PROVIDER=http_form")
+        return self
+
     @field_validator("log_level")
     @classmethod
     def _upper_level(cls, value: str) -> str:
         return value.upper()
+
+    def lane_specs(self) -> list[tuple[str, SecretStr | None]]:
+        """``(name, proxy)`` per lane; names show host:port only, never credentials."""
+        lanes: list[tuple[str, SecretStr | None]] = []
+        if self.proxy_include_direct or not self.proxy_urls:
+            lanes.append(("direct", None))
+        for index, secret in enumerate(self.proxy_urls, 1):
+            url = httpx.URL(secret.get_secret_value())
+            lanes.append((f"proxy{index} ({url.host}:{url.port})", secret))
+        return lanes
 
     def url(self, path: str) -> str:
         return self.base_url.rstrip("/") + "/" + path

@@ -31,6 +31,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
 import httpx
+from pydantic import SecretStr
 
 from cem_scraper.captcha import TOKEN_LIFETIME_S, CaptchaProvider, CaptchaUnavailable
 from cem_scraper.client import CemClient, ClientError, sanitize_snapshot
@@ -616,19 +617,38 @@ def build_access_provider(settings: Settings, captcha: CaptchaProvider) -> Acces
 
 
 @dataclass
+class Lane:
+    """One exit IP (this machine or one proxy) with its own server-facing limits.
+
+    Each lane enters the official form on its own (its own cookie, its own CAPTCHA),
+    so the session cookie is always used from the IP that obtained it.
+    """
+
+    name: str
+    proxy: SecretStr | None = field(repr=False)
+    traffic: TrafficControl
+    authorizing: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
+    active: int = 0  # examination sessions open (or being authorized) on this lane
+
+
+@dataclass
 class AuthorizedSession:
     session: ExamSession
     client: CemClient
     grant: AccessGrant
+    lane: Lane
     reauthorizations: int = 0
+    released: bool = False
 
 
 class SessionManager:
     """Hands out authorized ``CemClient``s, one per examination session.
 
-    All clients share one ``TrafficControl``, so collecting sessions in parallel
-    never multiplies the request rate. Authorizations are serialized: at most one
-    official-form entry (one CAPTCHA for the user) is in progress at a time.
+    Sessions are spread over the lanes (``CEM_PROXY_URLS``; just "direct" by
+    default), the least busy lane first. Clients of one lane share its
+    ``TrafficControl``, so parallel sessions never multiply one IP's request rate.
+    Authorizations are serialized per lane: one official-form entry (one CAPTCHA)
+    at a time on each IP.
     """
 
     def __init__(
@@ -641,29 +661,48 @@ class SessionManager:
         self.settings = settings
         self.provider = provider
         self.metrics = metrics
-        self.traffic = traffic or TrafficControl(settings, metrics)
-        self._authorizing = asyncio.Lock()
+        if traffic is not None:
+            self.lanes = [Lane(traffic.name, None, traffic)]
+        else:
+            self.lanes = [
+                Lane(name, proxy, TrafficControl(settings, metrics, name=name)) for name, proxy in settings.lane_specs()
+            ]
+        self.traffic = self.lanes[0].traffic  # the only lane unless proxies are configured
 
-    def _new_client(self, transport: httpx.AsyncBaseTransport | None) -> CemClient:
-        return CemClient(self.settings, self.metrics, transport=transport, traffic=self.traffic)
+    def _new_client(self, transport: httpx.AsyncBaseTransport | None, lane: Lane) -> CemClient:
+        return CemClient(self.settings, self.metrics, transport=transport, traffic=lane.traffic, proxy=lane.proxy)
 
-    async def open(self, session: ExamSession, *, abort_if: Callable[[], bool] | None = None) -> AuthorizedSession:
-        async with self._authorizing:
-            if abort_if is not None and abort_if():  # don't ask for another CAPTCHA for a stopping run
-                raise OpenCancelled(f"run stopped before {session.label} was authorized")
-            client = self._new_client(self.provider.base_transport())
-            try:
-                grant = await self.provider.acquire(session, client)
-            except BaseException:
-                await client.aclose()
-                raise
+    async def open(
+        self,
+        session: ExamSession,
+        *,
+        abort_if: Callable[[], bool] | None = None,
+        lane: Lane | None = None,
+    ) -> AuthorizedSession:
+        lane = lane or min(self.lanes, key=lambda candidate: candidate.active)
+        lane.active += 1
+        try:
+            async with lane.authorizing:
+                if abort_if is not None and abort_if():  # don't ask for another CAPTCHA for a stopping run
+                    raise OpenCancelled(f"run stopped before {session.label} was authorized")
+                client = self._new_client(self.provider.base_transport(), lane)
+                try:
+                    grant = await self.provider.acquire(session, client)
+                except BaseException:
+                    await client.aclose()
+                    raise
+        except BaseException:
+            lane.active -= 1
+            raise
         if grant.transport is not None:
             await client.aclose()
-            client = self._new_client(grant.transport)
+            client = self._new_client(grant.transport, lane)
         if grant.question_url:
             client.question_url = grant.question_url
             log.info("questions for %s are requested from %s", session.label, grant.question_url)
-        return AuthorizedSession(session=session, client=client, grant=grant)
+        if len(self.lanes) > 1:
+            log.info("%s is collected through lane %s", session.label, lane.name)
+        return AuthorizedSession(session=session, client=client, grant=grant, lane=lane)
 
     async def reauthorize(self, auth: AuthorizedSession) -> AuthorizedSession:
         """Obtain a fresh grant after expiry, within the configured limit; else ``AccessBlocked``."""
@@ -673,12 +712,15 @@ class SessionManager:
                 f"({self.settings.max_reauthorizations_per_session}) is reached"
             )
         log.warning("authorization for %s expired; re-authorizing", auth.session.label)
-        await auth.client.aclose()
-        fresh = await self.open(auth.session)
+        await self.release(auth)
+        fresh = await self.open(auth.session, lane=auth.lane)  # same IP as before
         fresh.reauthorizations = auth.reauthorizations + 1
         return fresh
 
     async def release(self, auth: AuthorizedSession) -> None:
+        if not auth.released:
+            auth.released = True
+            auth.lane.active -= 1
         await auth.client.aclose()
 
     async def close(self) -> None:

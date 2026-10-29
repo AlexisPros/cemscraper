@@ -157,13 +157,15 @@ class TwoCaptchaProvider(CaptchaProvider):
         self._balance_checked = False
         self.spent = Decimal(0)
         self.solves = 0
+        self._in_progress = 0  # solves running right now (one per lane), counted against the caps
 
     @property
     def available(self) -> bool:
         return bool(self._key and self._key.get_secret_value()) and self._within_budget()
 
     def _within_budget(self) -> bool:
-        return self.solves < self.max_solves and self.spent < self.max_spend
+        pending = self._in_progress
+        return self.solves + pending < self.max_solves and self.spent + pending * self.FALLBACK_COST < self.max_spend
 
     async def close(self) -> None:
         await self._http.aclose()
@@ -233,6 +235,15 @@ class TwoCaptchaProvider(CaptchaProvider):
                 f"CAPTCHA budget for this run reached ({self.solves} solves, {self.spent} spent; "
                 f"limits {self.max_solves} / {self.max_spend})"
             )
+        self._in_progress += 1
+        try:
+            return await self._solve(site_key, page_url, invisible, api_domain, data_s)
+        finally:
+            self._in_progress -= 1
+
+    async def _solve(
+        self, site_key: str, page_url: str, invisible: bool, api_domain: str | None, data_s: str | None
+    ) -> CaptchaSolution:
         await self._check_balance_once()
         # https://2captcha.com/api-docs/recaptcha-v2 ; optional fields only when the page needs them.
         task: dict[str, Any] = {"type": "RecaptchaV2TaskProxyless", "websiteURL": page_url, "websiteKey": site_key}

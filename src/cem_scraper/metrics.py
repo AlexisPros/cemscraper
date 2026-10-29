@@ -33,13 +33,18 @@ class Metrics:
     questions_failed: int = 0
     outcomes: Counter[str] = field(default_factory=Counter)
     per_session: dict[str, Counter[str]] = field(default_factory=lambda: defaultdict(Counter))
+    per_lane: dict[str, list[float]] = field(default_factory=lambda: defaultdict(list))
+    lane_failures: Counter[str] = field(default_factory=Counter)
     concurrency_changes: list[dict[str, Any]] = field(default_factory=list)
     captcha_solves: int = 0
     captcha_cost: Decimal = Decimal(0)
 
-    def record_request(self, duration: float, status_code: int | None, ok: bool) -> None:
+    def record_request(self, duration: float, status_code: int | None, ok: bool, *, lane: str = "direct") -> None:
         self.requests += 1
         self.durations.append(duration)
+        self.per_lane[lane].append(duration)
+        if not ok:
+            self.lane_failures[lane] += 1
         if status_code is not None:
             self.status_codes[status_code] += 1
         if ok:
@@ -102,6 +107,14 @@ class Metrics:
             "questions_per_minute": round(self.questions_succeeded / minutes, 2) if minutes > 0 else None,
             "total_duration_s": round(self.elapsed, 2),
             "per_session": {code: dict(c) for code, c in sorted(self.per_session.items())},
+            "lanes": {
+                lane: {
+                    "requests": len(times),
+                    "failures": self.lane_failures[lane],
+                    "duration_median_s": round(statistics.median(times), 3),
+                }
+                for lane, times in self.per_lane.items()
+            },
             "concurrency_changes": self.concurrency_changes,
             "captcha_solves": self.captcha_solves,
             "captcha_cost": float(self.captcha_cost),

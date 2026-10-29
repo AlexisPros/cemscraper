@@ -215,16 +215,21 @@ class CircuitBreaker:
 
 
 class TrafficControl:
-    """Rate limit + in-flight limit + circuit breaker, shared by all clients of a run."""
+    """Rate limit + in-flight limit + circuit breaker, shared by all clients of one lane.
+
+    A lane is one exit IP (this machine or one proxy); the run has one per IP.
+    """
 
     def __init__(
         self,
         settings: Settings,
         metrics: Metrics | None = None,
         *,
+        name: str = "direct",
         limiter: RateLimiter | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
+        self.name = name
         self.limiter = limiter or RateLimiter(settings.requests_per_second, sleep=sleep)
         self.concurrency = AdaptiveConcurrency(
             settings.concurrency,

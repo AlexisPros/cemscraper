@@ -168,6 +168,43 @@ open session stops. In a 10×-compressed simulation (2 sessions × 30 questions,
 latency, 30 s per CAPTCHA), collection took 3.9 min instead of 6.8 min (1.8×) with the
 same request-rate cap.
 
+### Proxy lanes (with the site operator's permission)
+
+CEM's administrators allowed collecting through several IPs, to measure whether
+throughput grows with the number of exit IPs. Each proxy in `CEM_PROXY_URLS` becomes
+a *lane*: its own CEM session cookie, its own CAPTCHA, its own rate limiter,
+concurrency limit and circuit breaker. `CEM_PROXY_INCLUDE_DIRECT=true` (default)
+keeps this machine's IP as a lane too. Sessions go to the least busy lane, up to
+`CEM_PIPELINE_DEPTH` per lane, and a re-authorization stays on the lane that
+obtained the cookie. The rate limits are **per lane**: with 2 lanes at 1.5 rps,
+CEM receives up to 3 requests per second in total.
+
+```
+CEM_ACCESS_PROVIDER=http_form
+# 2Captcha residential proxies (https://2captcha.com/proxy/residential-proxies): take host:port,
+# login and password from the proxy generator. Set "IP duration" to 15-30 min (max 120):
+# 0 means a new IP for every request, which breaks the CEM cookie. URL-encode special characters.
+CEM_PROXY_URLS=http://LOGIN:PASSWORD@HOST:PORT,http://LOGIN2:PASSWORD2@HOST:PORT
+```
+
+Only `http(s)://user:pass@host:port` proxies are accepted, and only with
+`http_form` (a browser would authorize from your own IP). Lane names in logs show
+`host:port`, never credentials. The CAPTCHA is still solved by 2Captcha's own workers
+(`RecaptchaV2TaskProxyless`); the token is submitted from the lane's IP. The run caps
+count CAPTCHAs being solved in parallel on several lanes, so they cannot be exceeded.
+With more than one lane, the report prints requests, failures and median latency
+per lane. A proxy that keeps failing opens its lane's circuit breaker, which stops
+the run like any server failure.
+
+Traffic: a question page is ~25 KB of HTML, so one session (120 questions, entry pages)
+is ~3-3.5 MB through its lane, and all 23 sessions ~80 MB. 2Captcha counts incoming plus
+outgoing traffic; CAPTCHA API calls don't go through the proxy.
+
+Measuring linear growth: run the same number of sessions with 1, 2, 3 ... lanes,
+in `--memory`, and compare `q/min` and the per-lane median latency. If the total
+grows while each lane's latency stays flat, the limit was per IP; if latency rises
+on every lane, CEM's own capacity is the limit and more proxies won't help.
+
 ### Discovery and failure classification
 
 Questions are requested from 1 upward through the sliding window. A session
@@ -387,4 +424,5 @@ Accept the terms of use yourself (`CEM_ACCEPT_EULA` is off by default). Keep
 request rates low, and identify yourself with `CEM_CONTACT_EMAIL`. Content that is publicly
 viewable is not the same as permission to collect it in bulk; ask CEM if in doubt.
 CAPTCHA solving through 2Captcha is opt-in, capped, and your decision with respect
-to CEM's terms. The tool contains no token replay, fingerprint evasion, or proxy rotation.
+to CEM's terms. The tool contains no token replay or fingerprint evasion. Proxy lanes exist because
+CEM's administrators allowed them; don't use them on a site that didn't.

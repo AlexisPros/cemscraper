@@ -24,6 +24,7 @@ from pathlib import Path
 
 import httpx
 from bs4 import BeautifulSoup
+from pydantic import SecretStr
 
 from cem_scraper.config import EXAM_TYPE, QUESTION_PATH, Settings
 from cem_scraper.metrics import Metrics
@@ -106,7 +107,8 @@ class CemClient:
 
     All server-facing limits (request spacing, in-flight cap, circuit breaker)
     come from ``traffic``, which a ``SessionManager`` shares between the clients
-    of a run. A standalone client gets its own.
+    of one lane (exit IP). A standalone client gets its own. ``proxy`` routes the
+    client through that lane's proxy.
     """
 
     def __init__(
@@ -116,6 +118,7 @@ class CemClient:
         *,
         transport: httpx.AsyncBaseTransport | None = None,
         traffic: TrafficControl | None = None,
+        proxy: SecretStr | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         self.settings = settings
@@ -134,6 +137,8 @@ class CemClient:
             ),
             headers={"User-Agent": settings.effective_user_agent(), "Accept-Language": "pl,en;q=0.5"},
             follow_redirects=True,
+            # A custom transport (fixtures, browser context) already decides where requests go.
+            proxy=proxy.get_secret_value() if proxy is not None and transport is None else None,
         )
 
     @property
@@ -175,14 +180,14 @@ class CemClient:
                 except (httpx.TimeoutException, httpx.TransportError) as exc:
                     elapsed = time.monotonic() - started
                     overloaded = True
-                    self.metrics.record_request(elapsed, None, ok=False)
+                    self.metrics.record_request(elapsed, None, ok=False, lane=self.traffic.name)
                     last_error = f"{type(exc).__name__} after {elapsed:.1f}s"
                     log.warning("%s %s failed (attempt %d): %s", method, path, attempt + 1, last_error)
                 else:
                     latency = time.monotonic() - started
                     status = response.status_code
                     ok = 200 <= status < 300
-                    self.metrics.record_request(latency, status, ok=ok)
+                    self.metrics.record_request(latency, status, ok=ok, lane=self.traffic.name)
                     log.debug("%s %s -> %d in %.2fs", method, path, status, latency)
                     if ok:
                         breaker.success()
