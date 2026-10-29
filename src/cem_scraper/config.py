@@ -77,6 +77,9 @@ class Settings(BaseSettings):
     proxy_urls: Annotated[list[SecretStr], NoDecode] = Field(default_factory=list)
     # Also collect through this machine's own IP, next to the proxies.
     proxy_include_direct: bool = True
+    # Paid proxy traffic a proxy lane may use per run (sent + received, approximate); then the lane
+    # is retired and its sessions continue on the other lanes. One session is ~3-3.5 MB.
+    proxy_max_mb: float = Field(default=150.0, gt=0)
     connect_timeout: float = Field(default=10.0, gt=0)
     read_timeout: float = Field(default=45.0, gt=0)
     max_retries: int = Field(default=4, ge=0, le=10)
@@ -162,6 +165,10 @@ class Settings(BaseSettings):
             if url is None or url.scheme not in ("http", "https") or not url.host or not url.port:
                 # Never echo the value: it carries the proxy password.
                 raise ValueError(f"CEM_PROXY_URLS entry {index} must look like http://user:pass@host:port")
+        values = [secret.get_secret_value().strip().rstrip("/") for secret in self.proxy_urls]
+        if len(set(values)) != len(values):
+            # The same login/session is the same exit IP: a second lane would only double the load.
+            raise ValueError("CEM_PROXY_URLS lists the same proxy twice")
         if self.proxy_urls and self.access_provider not in (AccessProviderName.HTTP_FORM, AccessProviderName.FIXTURES):
             # A browser authorizes from this machine's IP; its cookie would then be used from another IP.
             raise ValueError("CEM_PROXY_URLS works only with CEM_ACCESS_PROVIDER=http_form")

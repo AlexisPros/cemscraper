@@ -192,9 +192,27 @@ Only `http(s)://user:pass@host:port` proxies are accepted, and only with
 `host:port`, never credentials. The CAPTCHA is still solved by 2Captcha's own workers
 (`RecaptchaV2TaskProxyless`); the token is submitted from the lane's IP. The run caps
 count CAPTCHAs being solved in parallel on several lanes, so they cannot be exceeded.
-With more than one lane, the report prints requests, failures and median latency
-per lane. A proxy that keeps failing opens its lane's circuit breaker, which stops
-the run like any server failure.
+The report prints requests, failures, median latency and approximate traffic per lane.
+
+**When a proxy breaks, the run keeps going.** A broken lane is *retired*: its sessions
+continue on the other lanes, and stored questions are not downloaded again.
+
+| What happens on a proxy lane | Detected as | Reaction |
+|---|---|---|
+| Wrong login, proxy balance used up, proxy blocks us | `ProxyError` 4xx (e.g. `407`) | retired at once, no retry |
+| Proxy unreachable (refused, DNS, connect timeout, 5xx from the proxy) | 3 failures in a row | retired; CEM is not paused or slowed down |
+| No successful answer for `CEM_STALL_TIMEOUT` (180 s) | stall | retired (on the direct lane: CEM is down, the run stops) |
+| `CEM_PROXY_MAX_MB` (150 MB) sent + received in this run | traffic cap | retired before sending more |
+
+Costs of a failure: a proxy that fails at the EULA page costs no CAPTCHA (the CAPTCHA
+is bought only after the EULA and form pages loaded through that proxy). A proxy that
+fails during collection costs one more CAPTCHA (~0.003) to re-enter the session on
+another lane. A proxy that fails exactly while the solved form is being submitted
+wastes that one token. With no working lane left, sessions are reported as blocked and
+the run stops; rerunning resumes. The traffic count is an estimate (headers + compressed
+bodies as received, without TLS overhead), so keep the cap below what you bought.
+After a fail-over during `--refetch`, questions stored before this run are kept, not
+fetched again.
 
 Traffic: a question page is ~25 KB of HTML, so one session (120 questions, entry pages)
 is ~3-3.5 MB through its lane, and all 23 sessions ~80 MB. 2Captcha counts incoming plus

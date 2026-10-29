@@ -58,6 +58,11 @@ class RequestFailed(ClientError):
     """A request failed after exhausting retries (transient error)."""
 
 
+class LaneFailed(ClientError):
+    """A proxy lane is unusable: proxy refused (wrong login, no traffic left), unreachable,
+    stalled, disabled or over its traffic cap. The session moves to another lane."""
+
+
 class UnexpectedStatus(ClientError):
     """Non-retryable, non-auth HTTP status (e.g. 404)."""
 
@@ -166,9 +171,14 @@ class CemClient:
         breaker = self.traffic.breaker
         lane = self.traffic.name
         last_error = "unknown error"
+        traffic = self.traffic
         for attempt in range(max_retries + 1):
+            if traffic.disabled:
+                raise LaneFailed(f"lane {lane} is disabled: {traffic.disabled}")
+            if traffic.over_byte_cap():
+                raise LaneFailed(f"lane {lane} used its traffic cap of {traffic.byte_cap / 1e6:.0f} MB for this run")
             if breaker.open:
-                raise ServerUnavailable(f"circuit breaker open on lane {lane}: the server keeps failing")
+                raise self._lane_or_server(f"circuit breaker open on lane {lane}: the server keeps failing")
             delay: float | None = None
             ticket = await self.traffic.concurrency.acquire()
             latency: float | None = None
@@ -180,15 +190,31 @@ class CemClient:
                     response = await self._http.request(method, path, data=data)
                 except (httpx.TimeoutException, httpx.TransportError) as exc:
                     elapsed = time.monotonic() - started
-                    overloaded = True
-                    self.metrics.record_request(elapsed, None, ok=False, lane=self.traffic.name)
+                    sent = _request_bytes(exc.request) if _has_request(exc) else 0
+                    traffic.add_bytes(sent)
+                    self.metrics.record_request(elapsed, None, ok=False, lane=lane, nbytes=sent)
                     last_error = f"{type(exc).__name__} after {elapsed:.1f}s"
                     log.warning("%s %s failed (lane %s, attempt %d): %s", method, path, lane, attempt + 1, last_error)
+                    if traffic.proxied and isinstance(exc, httpx.ProxyError) and str(exc)[:1] == "4":
+                        # 407 wrong login, 402/403 no traffic left or blocked: retrying cannot help.
+                        raise LaneFailed(f"proxy of lane {lane} refused the connection: {str(exc)[:60]}") from exc
+                    if traffic.proxied and isinstance(
+                        exc, (httpx.ProxyError, httpx.ConnectError, httpx.ConnectTimeout)
+                    ):
+                        # The TCP connection goes to the proxy: this is the proxy's fault, not CEM's.
+                        if breaker.proxy_fault():
+                            raise LaneFailed(
+                                f"proxy of lane {lane} failed {breaker.proxy_fault_limit} times in a row: {last_error}"
+                            ) from exc
+                    else:
+                        overloaded = True
                 else:
                     latency = time.monotonic() - started
                     status = response.status_code
                     ok = 200 <= status < 300
-                    self.metrics.record_request(latency, status, ok=ok, lane=self.traffic.name)
+                    used = _request_bytes(response.request) + _response_bytes(response)
+                    traffic.add_bytes(used)
+                    self.metrics.record_request(latency, status, ok=ok, lane=lane, nbytes=used)
                     log.debug("%s %s -> %d in %.2fs", method, path, status, latency)
                     if ok:
                         breaker.success()
@@ -211,7 +237,7 @@ class CemClient:
             finally:
                 self.traffic.concurrency.release(ticket, latency, overloaded=overloaded)
             if overloaded and breaker.attempt_failed():
-                raise ServerUnavailable(
+                raise self._lane_or_server(
                     f"lane {lane}: no successful response for {breaker.stall_timeout:.0f}s; last: {last_error}"
                 )
             if attempt == max_retries:
@@ -232,10 +258,15 @@ class CemClient:
                 await self._sleep(wait)
 
         if breaker.failure():
-            raise ServerUnavailable(
-                f"{breaker.consecutive_failures} consecutive requests failed after retries; last: {last_error}"
+            raise self._lane_or_server(
+                f"lane {lane}: {breaker.consecutive_failures} consecutive requests failed after retries; "
+                f"last: {last_error}"
             )
         raise RequestFailed(f"{method} {path} failed after {max_retries + 1} attempt(s): {last_error}")
+
+    def _lane_or_server(self, message: str) -> ClientError:
+        """A stalled proxy lane is retired (the session moves on); a stalled direct lane means CEM is down."""
+        return LaneFailed(message) if self.traffic.proxied else ServerUnavailable(message)
 
     async def get(self, path: str) -> PageResponse:
         return await self.request("GET", path)
@@ -263,6 +294,36 @@ class CemClient:
         if self.settings.save_html_dir:
             save_snapshot(self.settings.save_html_dir, session.session_code, number, page.html)
         return page
+
+
+def _has_request(exc: httpx.RequestError) -> bool:
+    try:
+        exc.request  # noqa: B018 - raises RuntimeError when the request was never built
+    except RuntimeError:
+        return False
+    return True
+
+
+def _headers_bytes(headers: httpx.Headers) -> int:
+    return sum(len(name) + len(value) + 4 for name, value in headers.raw)
+
+
+def _request_bytes(request: httpx.Request) -> int:
+    """Approximate bytes sent (request line, headers, body); TLS overhead is not included."""
+    try:
+        body = len(request.content)
+    except httpx.RequestNotRead:
+        body = 0
+    return len(request.method) + len(request.url.raw_path) + 12 + _headers_bytes(request.headers) + body
+
+
+def _response_bytes(response: httpx.Response) -> int:
+    """Bytes received: status line, headers and the body as sent on the wire (compressed).
+
+    A response that was never streamed (built in memory) reports 0 downloaded bytes;
+    its decoded size is counted instead, which can only overestimate.
+    """
+    return 17 + _headers_bytes(response.headers) + (response.num_bytes_downloaded or len(response.content))
 
 
 def save_snapshot(directory: Path, session_code: str, number: int, html: str) -> Path:

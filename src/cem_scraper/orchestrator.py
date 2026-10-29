@@ -31,6 +31,7 @@ from pathlib import Path
 
 from cem_scraper.client import (
     AccessDenied,
+    LaneFailed,
     RequestFailed,
     ServerThrottled,
     ServerUnavailable,
@@ -291,6 +292,8 @@ class Orchestrator:
             await self.repo.set_session_status(state.id, CollectionStatus.BLOCKED, last_error=str(exc))
             report.outcome, report.error = SessionOutcome.BLOCKED, str(exc)
             return report
+        except LaneFailed as exc:  # the lane is already disabled by the session manager
+            return await self._fail_over(session, run_id, exc, only_failed=only_failed, abort_if=abort_if)
         await self.repo.set_session_status(
             state.id, CollectionStatus.IN_PROGRESS, expected_question_count=auth.grant.question_limit
         )
@@ -305,10 +308,35 @@ class Orchestrator:
             await self.repo.set_session_status(state.id, final, last_error=str(stop))
             report.outcome, report.error = stop.outcome, str(stop)
             return report
+        except LaneFailed as exc:
+            self.sessions.disable(auth.lane, str(exc))
+            lane_failure: LaneFailed | None = exc
+        else:
+            lane_failure = None
         finally:
             await self.sessions.release(auth)
+        if lane_failure is not None:
+            return await self._fail_over(session, run_id, lane_failure, only_failed=only_failed, abort_if=abort_if)
 
         return await self._finalize(state.id, session, report, highest, refine=only_failed)
+
+    async def _fail_over(
+        self,
+        session: ExamSession,
+        run_id: object,
+        failure: LaneFailed,
+        *,
+        only_failed: bool,
+        abort_if: Callable[[], bool] | None,
+    ) -> SessionReport:
+        """Continue a session on another lane after its proxy failed.
+
+        Stored questions are kept, so only the rest is fetched (one new CAPTCHA).
+        Each failure disables a lane, so this ends: with no lane left, ``open``
+        reports the session as blocked.
+        """
+        log.warning("%s: %s; continuing on another lane", session.label, failure)
+        return await self.scrape_session(session, run_id, refetch=False, only_failed=only_failed, abort_if=abort_if)
 
     def _has_snapshot(self, session: ExamSession, number: int) -> bool:
         directory = self.settings.save_html_dir

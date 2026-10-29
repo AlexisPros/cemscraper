@@ -35,12 +35,17 @@ class Metrics:
     per_session: dict[str, Counter[str]] = field(default_factory=lambda: defaultdict(Counter))
     per_lane: dict[str, list[float]] = field(default_factory=lambda: defaultdict(list))
     lane_failures: Counter[str] = field(default_factory=Counter)
+    lane_bytes: Counter[str] = field(default_factory=Counter)
+    lanes_disabled: dict[str, str] = field(default_factory=dict)
     concurrency_changes: list[dict[str, Any]] = field(default_factory=list)
     captcha_solves: int = 0
     captcha_cost: Decimal = Decimal(0)
 
-    def record_request(self, duration: float, status_code: int | None, ok: bool, *, lane: str = "direct") -> None:
+    def record_request(
+        self, duration: float, status_code: int | None, ok: bool, *, lane: str = "direct", nbytes: int = 0
+    ) -> None:
         self.requests += 1
+        self.lane_bytes[lane] += nbytes
         self.durations.append(duration)
         self.per_lane[lane].append(duration)
         if not ok:
@@ -112,6 +117,8 @@ class Metrics:
                     "requests": len(times),
                     "failures": self.lane_failures[lane],
                     "duration_median_s": round(statistics.median(times), 3),
+                    "megabytes": round(self.lane_bytes[lane] / 1e6, 2),
+                    "disabled": self.lanes_disabled.get(lane),
                 }
                 for lane, times in self.per_lane.items()
             },

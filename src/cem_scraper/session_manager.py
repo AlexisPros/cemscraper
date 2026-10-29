@@ -34,7 +34,7 @@ import httpx
 from pydantic import SecretStr
 
 from cem_scraper.captcha import TOKEN_LIFETIME_S, CaptchaProvider, CaptchaUnavailable
-from cem_scraper.client import CemClient, ClientError, sanitize_snapshot
+from cem_scraper.client import CemClient, ClientError, LaneFailed, sanitize_snapshot
 from cem_scraper.config import (
     EULA_PATH,
     EXAM_TYPE,
@@ -230,6 +230,8 @@ class HttpFormAccessProvider(AccessProvider):
                 fields.pop("g-recaptcha-response", None)  # single use, never kept
         except CaptchaUnavailable as exc:
             raise AccessBlocked(str(exc)) from exc
+        except LaneFailed:
+            raise  # the proxy failed, not the entry: the session moves to another lane
         except ClientError as exc:
             raise AccessBlocked(f"session entry failed: {exc}") from exc
         kind = classify_page(make_soup(first.html))
@@ -665,7 +667,8 @@ class SessionManager:
             self.lanes = [Lane(traffic.name, None, traffic)]
         else:
             self.lanes = [
-                Lane(name, proxy, TrafficControl(settings, metrics, name=name)) for name, proxy in settings.lane_specs()
+                Lane(name, proxy, TrafficControl(settings, metrics, name=name, proxied=proxy is not None))
+                for name, proxy in settings.lane_specs()
             ]
         self.traffic = self.lanes[0].traffic  # the only lane unless proxies are configured
 
@@ -679,18 +682,32 @@ class SessionManager:
         abort_if: Callable[[], bool] | None = None,
         lane: Lane | None = None,
     ) -> AuthorizedSession:
-        lane = lane or min(self.lanes, key=lambda candidate: candidate.active)
+        if lane is None:
+            working = [candidate for candidate in self.lanes if not candidate.traffic.disabled]
+            if not working:
+                raise AccessBlocked(
+                    "no working lane left: " + "; ".join(f"{c.name}: {c.traffic.disabled}" for c in self.lanes)
+                )
+            lane = min(working, key=lambda candidate: candidate.active)
+        elif lane.traffic.disabled:
+            raise LaneFailed(f"lane {lane.name} is disabled: {lane.traffic.disabled}")
         lane.active += 1
         try:
             async with lane.authorizing:
                 if abort_if is not None and abort_if():  # don't ask for another CAPTCHA for a stopping run
                     raise OpenCancelled(f"run stopped before {session.label} was authorized")
+                if lane.traffic.disabled:  # retired while this session waited for the lane
+                    raise LaneFailed(f"lane {lane.name} is disabled: {lane.traffic.disabled}")
                 client = self._new_client(self.provider.base_transport(), lane)
                 try:
                     grant = await self.provider.acquire(session, client)
                 except BaseException:
                     await client.aclose()
                     raise
+        except LaneFailed as exc:
+            lane.active -= 1
+            self.disable(lane, str(exc))
+            raise
         except BaseException:
             lane.active -= 1
             raise
@@ -712,10 +729,22 @@ class SessionManager:
                 f"({self.settings.max_reauthorizations_per_session}) is reached"
             )
         log.warning("authorization for %s expired; re-authorizing", auth.session.label)
-        await self.release(auth)
+        await auth.client.aclose()
         fresh = await self.open(auth.session, lane=auth.lane)  # same IP as before
-        fresh.reauthorizations = auth.reauthorizations + 1
-        return fresh
+        # Updated in place: whoever holds ``auth`` releases the new client, and the lane counts it once.
+        auth.lane.active -= 1
+        auth.client, auth.grant = fresh.client, fresh.grant
+        auth.reauthorizations += 1
+        return auth
+
+    def disable(self, lane: Lane, reason: str) -> None:
+        """Take a lane out of service; its open sessions fail over at their next request."""
+        if lane.traffic.disabled:
+            return
+        lane.traffic.disabled = reason
+        self.metrics.lanes_disabled[lane.name] = reason
+        working = [candidate.name for candidate in self.lanes if not candidate.traffic.disabled]
+        log.error("lane %s disabled: %s; still working: %s", lane.name, reason, ", ".join(working) or "none")
 
     async def release(self, auth: AuthorizedSession) -> None:
         if not auth.released:

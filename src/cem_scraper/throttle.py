@@ -214,11 +214,19 @@ class CircuitBreaker:
         self.consecutive_failures = 0
         self.failing_since: float | None = None
         self.open = False
+        self.proxy_faults = 0
+        self.proxy_fault_limit = 3
         self._clock = clock
 
     def success(self) -> None:
         self.consecutive_failures = 0
         self.failing_since = None
+        self.proxy_faults = 0
+
+    def proxy_fault(self) -> bool:
+        """Record a failed connection to the lane's proxy; True once it failed too often in a row."""
+        self.proxy_faults += 1
+        return self.proxy_faults >= self.proxy_fault_limit
 
     def attempt_failed(self) -> bool:
         """Record one failed attempt; returns True when the lane has been stalled too long."""
@@ -249,10 +257,17 @@ class TrafficControl:
         metrics: Metrics | None = None,
         *,
         name: str = "direct",
+        proxied: bool = False,
         limiter: RateLimiter | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         self.name = name
+        self.proxied = proxied
+        # Bytes sent and received on this lane; a proxy lane stops at its cap (paid traffic).
+        self.bytes_used = 0
+        self.byte_cap: float = settings.proxy_max_mb * 1e6 if proxied else float("inf")
+        # Reason this lane was taken out of service (None while it works).
+        self.disabled: str | None = None
         self.limiter = limiter or RateLimiter(settings.requests_per_second, sleep=sleep)
         self.concurrency = AdaptiveConcurrency(
             settings.concurrency,
@@ -263,3 +278,9 @@ class TrafficControl:
             on_change=metrics.record_concurrency_change if metrics else None,
         )
         self.breaker = CircuitBreaker(settings.circuit_breaker_threshold, settings.stall_timeout)
+
+    def add_bytes(self, count: int) -> None:
+        self.bytes_used += count
+
+    def over_byte_cap(self) -> bool:
+        return self.bytes_used >= self.byte_cap

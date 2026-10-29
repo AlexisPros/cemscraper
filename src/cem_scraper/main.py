@@ -166,12 +166,14 @@ def _print_report(report: RunReport) -> None:
     if m.get("captcha_solves"):
         print(f"  captcha: {m['captcha_solves']} solved, cost {m['captcha_cost']:.4f} (2Captcha account currency)")
     lanes = cast(dict[str, dict[str, Any]], m.get("lanes") or {})
-    if len(lanes) > 1:
+    if len(lanes) > 1 or any(name != "direct" for name in lanes):
         for name, lane in lanes.items():
             print(
                 f"  lane {name}: requests={lane['requests']} failed={lane['failures']} "
-                f"median={lane['duration_median_s']}s"
+                f"median={lane['duration_median_s']}s traffic~{lane['megabytes']} MB"
             )
+            if lane["disabled"]:
+                print(f"      disabled: {lane['disabled']}")
     print(
         f"  requests={m['requests']} ok={m['request_successes']} failed={m['request_failures']} "
         f"retries={m['retries']} avg={secs('duration_avg_s')} median={secs('duration_median_s')} "
