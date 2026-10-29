@@ -58,8 +58,8 @@ class Settings(BaseSettings):
 
     # Throughput: deliberately conservative defaults.
     # Initial in-flight limit; with adaptive concurrency it moves within [1, max_concurrency].
-    concurrency: int = Field(default=2, ge=1, le=8)
-    max_concurrency: int = Field(default=4, ge=1, le=8)
+    concurrency: int = Field(default=2, ge=1, le=16)
+    max_concurrency: int = Field(default=4, ge=1, le=16)
     adaptive_concurrency: bool = True
     latency_tolerance: float = Field(default=1.5, gt=1)
     requests_per_second: float = Field(default=0.5, gt=0, le=5)

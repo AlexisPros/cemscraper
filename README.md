@@ -142,6 +142,17 @@ drop to 0.2 req/s. The controller (`throttle.py`) works per window of completed 
 - it lowers the limit when fewer requests in flight are enough.
 
 Changes are logged and stored in the run's `diagnostics.concurrency_changes`.
+
+Measured on one session (120 questions, 2Captcha entry, CEM answering in ~9 s):
+
+| `CEM_REQUESTS_PER_SECOND` / `CEM_CONCURRENCY` / `CEM_MAX_CONCURRENCY` | Total | Median latency |
+|---|---|---|
+| 0.5 / 2 / 4 (defaults) | 368 s | 8.8 s |
+| 1.0 / 6 / 8 | 226 s | 9.8 s |
+| 1.5 / 10 / 14 | 166 s | 11.9 s |
+
+Latency grows with load: CEM starts queueing our requests, so each step gains less.
+Raise these in steps and stop when the median latency climbs or requests start failing.
 Questions are dispatched through a sliding window, so one slow answer doesn't hold
 back the others.
 
@@ -289,7 +300,7 @@ The defaults are conservative: **0.5 requests/s; 2 requests in flight, adaptive 
 timeout (CEM sometimes takes about 10 s), 4 retries with full-jitter exponential
 backoff, `Retry-After` honored up to 300 s (anything longer stops the run), and a
 circuit breaker after 5 consecutive failed requests. The validator caps concurrency
-at 8 and the rate at 5 req/s.
+at 16 and the rate at 5 req/s.
 
 | Setting | Meaning |
 |---|---|
