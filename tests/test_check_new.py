@@ -129,3 +129,13 @@ async def test_a_form_without_sessions_is_an_error(env: None, monkeypatch: pytes
     h = Harness(monkeypatch, "<html><body><form><select name='sesja'></select></form></body></html>")
     assert await h.run() == cli.EXIT_ERROR
     assert h.scraped == []
+
+
+async def test_without_targets_nothing_counts_as_new(
+    env: None, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("CEM_TARGET_SESSIONS", "")
+    h = Harness(monkeypatch, form_with(NEW_OPTIONS))
+    assert await h.run() == cli.EXIT_ERROR
+    assert h.fetches == 0 and h.scraped == []  # not 38 "new" sessions
+    assert "CEM_TARGET_SESSIONS is empty" in capsys.readouterr().err

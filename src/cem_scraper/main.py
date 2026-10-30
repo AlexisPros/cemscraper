@@ -82,6 +82,10 @@ async def cmd_scrape(args: argparse.Namespace) -> int:
     elif args.provider:
         extra["access_provider"] = AccessProviderName(args.provider)
     settings = _settings(args, **extra)
+    if settings.access_provider is AccessProviderName.FIXTURES:
+        # Synthetic pages must never land next to (or over) real snapshots that `reparse` trusts,
+        # and local pages go through no proxy: no proxy lanes, no misleading proxy traffic.
+        settings = settings.model_copy(update={"save_html_dir": None, "proxy_urls": []})
     codes = args.session or settings.target_sessions
     for code in codes:
         ExamSession.from_code(code)  # validate early
@@ -90,17 +94,19 @@ async def cmd_scrape(args: argparse.Namespace) -> int:
     repo: Repository = InMemoryRepository() if use_memory else await _postgres(settings)
     metrics = Metrics()
     captcha = build_captcha_provider(settings, metrics)
+    # --dry-run promises no network at all, notifications included.
+    notifier = Notifier() if args.dry_run else build_notifier(settings)
     try:
         await limit_captcha_spending(captcha, settings, repo)
         provider = build_access_provider(settings, captcha)
-    except AccessBlocked as exc:
+    except AccessBlocked as exc:  # e.g. the lifetime CAPTCHA budget is used up
         log.error("%s", exc)
+        await _notify_quietly(notifier, run_message(RunStatus.BLOCKED, [], {}, note=f"Not started: {exc}"))
+        await notifier.close()
         await captcha.close()
         await repo.close()
         return EXIT_BLOCKED
     manager = SessionManager(settings, provider, metrics)
-    # --dry-run promises no network at all, notifications included.
-    notifier = Notifier() if args.dry_run else build_notifier(settings)
 
     async def session_done(session: ExamSession, report: SessionReport, done: int, total: int) -> None:
         await notifier.send(session_message(report, session.label, done, total))
@@ -392,6 +398,11 @@ async def cmd_check_new(args: argparse.Namespace) -> int:
         summaries = await repo.summaries()
     finally:
         await repo.close()
+    if not settings.target_sessions:
+        print(
+            "error: CEM_TARGET_SESSIONS is empty; without it every session in the form would look new", file=sys.stderr
+        )
+        return EXIT_ERROR
     completed = {s.session_code for s in summaries if s.collection_status == CollectionStatus.COMPLETED.value}
     # Only sessions after the newest configured target count, so older sessions that were never
     # targeted (2014-2025) are not mistaken for new ones. Any of them not completed yet is new,

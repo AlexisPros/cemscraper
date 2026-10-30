@@ -48,7 +48,7 @@ def fast(settings: Settings) -> Settings:
     [httpx.ReadTimeout("response lost"), httpx.RemoteProtocolError("dropped"), httpx.Response(502)],
 )
 @respx.mock
-async def test_create_task_is_not_resent_when_it_may_exist(lost_response: object) -> None:
+async def test_create_task_is_not_resent_when_it_may_exist(lost_response: httpx.Response | Exception) -> None:
     respx.post(f"{API}/getBalance").mock(return_value=ok(balance=1))
     create = respx.post(f"{API}/createTask").mock(side_effect=[lost_response, ok(taskId=2)])
     ft = FakeTime()
@@ -195,7 +195,7 @@ def _mock_cem(question_response: httpx.Response | None = None) -> respx.Route:
 
 @pytest.mark.parametrize("failure", [httpx.Response(503), httpx.ReadTimeout("slow")])
 @respx.mock
-async def test_token_is_submitted_exactly_once(settings: Settings, failure: object) -> None:
+async def test_token_is_submitted_exactly_once(settings: Settings, failure: httpx.Response | Exception) -> None:
     submit = respx.post(CEM + "wyswietl_pytania_pes.php").mock(side_effect=[failure, httpx.Response(200)])
     respx.get(CEM + "eula_pes.php").mock(return_value=httpx.Response(200, html=load(EDGE / "eula.html")))
     respx.post(CEM + "form_pytania_pes.php").mock(return_value=httpx.Response(200, html=load(EDGE / "entry_form.html")))

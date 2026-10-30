@@ -264,6 +264,42 @@ async def test_ctrl_c_still_sends_a_message(
     assert text.startswith("⏹ cem-scraper: run interrupted") and "Stopped with Ctrl+C." in text
 
 
+async def test_fixture_runs_never_write_into_the_snapshot_directory(
+    cli_env: None, monkeypatch: pytest.MonkeyPatch, tmp_path, respx_mock: respx.MockRouter
+) -> None:  # type: ignore[no-untyped-def]
+    respx_mock.post(SEND).mock(return_value=httpx.Response(200, json={"ok": True}))
+    snapshots = tmp_path / "html_snapshots"
+    snapshots.mkdir()
+    (snapshots / "20031_1.html").write_text("real page")
+    monkeypatch.setenv("CEM_SAVE_HTML_DIR", str(snapshots))
+    for argv in (["--dry-run"], ["--memory", "--provider", "fixtures"]):
+        args = cli.build_parser().parse_args(["scrape", *argv, "--session", "20031"])
+        assert await cli.cmd_scrape(args) == cli.EXIT_OK
+    assert [p.name for p in snapshots.iterdir()] == ["20031_1.html"]
+    assert (snapshots / "20031_1.html").read_text() == "real page"
+
+
+async def test_fixture_runs_show_no_proxy_lanes(
+    cli_env: None, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("CEM_PROXY_URLS", "http://user:pw@proxy.example.net:2334")
+    args = cli.build_parser().parse_args(["scrape", "--dry-run", "--session", "20031"])
+    assert await cli.cmd_scrape(args) == cli.EXIT_OK
+    assert "lane proxy1" not in capsys.readouterr().out
+
+
+async def test_a_run_refused_before_it_starts_is_reported(
+    cli_env: None, monkeypatch: pytest.MonkeyPatch, tmp_path, respx_mock: respx.MockRouter
+) -> None:  # type: ignore[no-untyped-def]
+    route = respx_mock.post(SEND).mock(return_value=httpx.Response(200, json={"ok": True}))
+    monkeypatch.setenv("CEM_FIXTURES_DIR", str(tmp_path / "missing"))  # the provider refuses to start
+    args = cli.build_parser().parse_args(["scrape", "--memory", "--provider", "fixtures", "--session", "20031"])
+    assert await cli.cmd_scrape(args) == cli.EXIT_BLOCKED
+    text = sent_text(route)
+    assert text.startswith("⛔ cem-scraper: run blocked") and "Not started: fixtures directory" in text
+    assert "Stored:" not in text
+
+
 async def test_notify_test_command(
     cli_env: None, capsys: pytest.CaptureFixture[str], respx_mock: respx.MockRouter
 ) -> None:

@@ -156,11 +156,12 @@ def run_message(status: RunStatus, sessions: list[SessionReport], metrics: dict[
         for report in sessions:
             counts[report.outcome.value] = counts.get(report.outcome.value, 0) + 1
         lines.append("Sessions: " + ", ".join(f"{n} {outcome}" for outcome, n in counts.items()))
-    stored = metrics.get("questions_succeeded", 0)
-    lines.append(
-        f"Stored: {stored} questions in {_duration(float(metrics.get('total_duration_s') or 0))}"
-        + (f" ({metrics['questions_per_minute']} q/min)" if metrics.get("questions_per_minute") else "")
-    )
+    if metrics:  # empty when the run was refused before it started
+        stored = metrics.get("questions_succeeded", 0)
+        lines.append(
+            f"Stored: {stored} questions in {_duration(float(metrics.get('total_duration_s') or 0))}"
+            + (f" ({metrics['questions_per_minute']} q/min)" if metrics.get("questions_per_minute") else "")
+        )
     if metrics.get("requests"):
         lines.append(
             f"Requests: {metrics.get('request_successes', 0)} ok, {metrics.get('request_failures', 0)} failed, "

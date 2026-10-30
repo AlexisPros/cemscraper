@@ -28,6 +28,7 @@ from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
+from typing import Any
 
 from cem_scraper.client import (
     AccessDenied,
@@ -118,7 +119,7 @@ class RunReport:
     run_id: str
     status: RunStatus
     sessions: list[SessionReport]
-    metrics: dict[str, object]
+    metrics: dict[str, Any]
 
 
 class _StopRun(Exception):

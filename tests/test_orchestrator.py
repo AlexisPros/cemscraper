@@ -32,7 +32,7 @@ ENTRY_FORM = load(EDGE / "entry_form.html")
 Responder = Callable[[str, int, "ScriptedProvider"], httpx.Response | str]
 
 
-def default_responder(total: int) -> Responder:
+def default_responder(total: int) -> Callable[[str, int, ScriptedProvider], str]:
     def respond(session: str, number: int, provider: ScriptedProvider) -> str:
         return question_page(number=number) if number <= total else NO_QUESTION
 

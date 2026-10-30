@@ -87,6 +87,7 @@ def standin_url() -> Iterator[str]:
     thread.start()
     yield f"http://127.0.0.1:{server.server_address[1]}/pytcem/"
     server.shutdown()
+    server.server_close()  # shutdown() stops the loop; this closes the listening socket
 
 
 async def play_human(provider: InteractiveBrowserAccessProvider, choose: str = "20031") -> None:
