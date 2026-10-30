@@ -24,7 +24,7 @@ from __future__ import annotations
 import asyncio
 import heapq
 import logging
-from collections.abc import Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
@@ -128,11 +128,24 @@ class _StopRun(Exception):
 
 
 class Orchestrator:
-    def __init__(self, settings: Settings, repository: Repository, sessions: SessionManager, metrics: Metrics) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        repository: Repository,
+        sessions: SessionManager,
+        metrics: Metrics,
+        *,
+        on_session_done: Callable[[ExamSession, SessionReport, int, int], Awaitable[None]] | None = None,
+    ) -> None:
         self.settings = settings
         self.repo = repository
         self.sessions = sessions
         self.metrics = metrics
+        # Called after each examination session that was actually worked on (e.g. a notification);
+        # arguments: session, report, sessions finished so far, sessions in the run.
+        self.on_session_done = on_session_done
+        self._finished = 0
+        self._total = 0
 
     async def run(self, session_codes: list[str], *, refetch: bool = False, only_failed: bool = False) -> RunReport:
         run_id = await self.repo.start_run(session_codes, self.sessions.provider.name)
@@ -147,6 +160,7 @@ class Orchestrator:
         )
         tasks: dict[str, asyncio.Task[SessionReport]] = {}
         reports: dict[str, SessionReport] = {}
+        self._finished, self._total = 0, len(session_codes)
         slots = asyncio.Semaphore(self.settings.pipeline_depth * len(lanes))
         stop = asyncio.Event()
         status = RunStatus.COMPLETED
@@ -230,6 +244,15 @@ class Orchestrator:
             len(report.failed),
             self.metrics.summary_line(),
         )
+        self._finished += 1
+        if self.on_session_done is not None and report.outcome not in (
+            SessionOutcome.SKIPPED,
+            SessionOutcome.NOT_STARTED,
+        ):
+            try:
+                await self.on_session_done(session, report, self._finished, self._total)
+            except Exception:  # a notification must never break collection
+                log.exception("session callback failed")
         if report.outcome in (SessionOutcome.BLOCKED, SessionOutcome.ABORTED):
             stop.set()  # launch no further sessions; authorizations not yet started are skipped
         if report.outcome is SessionOutcome.ABORTED:

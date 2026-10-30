@@ -129,6 +129,14 @@ class Settings(BaseSettings):
     # Send question requests through the authorized browser context instead of copying cookies.
     browser_context_requests: bool = False
 
+    # Notifications: your own Telegram bot (token from @BotFather) and your chat id
+    # (`cem-scraper telegram-chat-id` finds it). Without both, nothing is sent.
+    telegram_bot_token: SecretStr | None = None
+    telegram_chat_id: str | None = None
+    # Also a message after every examination session, not only at the end of the run.
+    telegram_notify_sessions: bool = False
+    telegram_base_url: str = "https://api.telegram.org"
+
     # Output / diagnostics
     output_dir: Path = Path("output")
     fixtures_dir: Path = Path("tests/fixtures/synthetic")

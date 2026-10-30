@@ -341,7 +341,27 @@ cem-scraper validate                            # re-validate stored records
 cem-scraper parse page.html --session 20031 --number 1   # offline parse
 cem-scraper verify-sessions --html form.html    # check YYYY1/YYYY2 codes against the form
 cem-scraper reparse                                # re-process saved snapshots (CEM_SAVE_HTML_DIR) offline
+cem-scraper telegram-chat-id                    # find your chat id for notifications
+cem-scraper notify-test                         # send a test Telegram message
 ```
+
+### Telegram notifications
+
+A message when a run ends: completed, partial, blocked, failed, or stopped with `Ctrl+C`.
+It lists the session outcomes, stored questions, duration, CAPTCHA cost, proxy traffic and
+retired lanes, and what went wrong. Optionally, a short message after every examination session.
+
+1. In Telegram, open @BotFather, send `/newbot` and copy the token.
+2. Put it in `.env`: `CEM_TELEGRAM_BOT_TOKEN=...`
+3. Open your new bot and press **Start** (or send it any message).
+4. `cem-scraper telegram-chat-id` prints the line to add: `CEM_TELEGRAM_CHAT_ID=...`
+5. `cem-scraper notify-test` sends a test message.
+6. Optional: `CEM_TELEGRAM_NOTIFY_SESSIONS=true` for a message after each session.
+
+Notifications are best effort: a failed message is logged as a warning and never stops a
+run. `--dry-run` sends nothing (it never touches the network). The token is part of the
+Bot API URL, so it is never logged: HTTPX request lines stay hidden, error messages carry only
+the error type, and every log line and outgoing text is redacted.
 
 Exit codes: `0` completed, `1` error, `2` blocked (access), `3` partial (some
 questions failed; rerun to retry them). `Ctrl+C` stops the run cleanly. The run is
@@ -369,6 +389,8 @@ at 16 and the rate at 5 req/s.
 | `CEM_BROWSER_CONTEXT_REQUESTS` | `true` sends HTTP requests through the authorized browser context instead of copying its cookies |
 | `CEM_SAVE_HTML_DIR` | Saves every fetched page with token-like inputs blanked; useful for building authentic fixtures |
 | `CEM_MAX_REAUTHORIZATIONS_PER_SESSION` | How many times an expired session may be re-entered (each costs one reCAPTCHA) |
+| `CEM_TELEGRAM_BOT_TOKEN` / `CEM_TELEGRAM_CHAT_ID` | Telegram notifications; both are needed |
+| `CEM_TELEGRAM_NOTIFY_SESSIONS` | Also a message after every examination session |
 
 ## Data
 

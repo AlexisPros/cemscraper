@@ -26,7 +26,8 @@ from cem_scraper.models import (
     QuestionData,
     RunStatus,
 )
-from cem_scraper.orchestrator import Orchestrator, RunReport
+from cem_scraper.notify import Notifier, TelegramNotifier, build_notifier, run_message, session_message
+from cem_scraper.orchestrator import Orchestrator, RunReport, SessionReport
 from cem_scraper.parser import ParseError, decode_html, parse_entry_form, parse_question_page
 from cem_scraper.session_manager import (
     AccessBlocked,
@@ -95,7 +96,14 @@ async def cmd_scrape(args: argparse.Namespace) -> int:
         await repo.close()
         return EXIT_BLOCKED
     manager = SessionManager(settings, provider, metrics)
-    orchestrator = Orchestrator(settings, repo, manager, metrics)
+    # --dry-run promises no network at all, notifications included.
+    notifier = Notifier() if args.dry_run else build_notifier(settings)
+
+    async def session_done(session: ExamSession, report: SessionReport, done: int, total: int) -> None:
+        await notifier.send(session_message(report, session.label, done, total))
+
+    per_session = notifier.enabled and settings.telegram_notify_sessions
+    orchestrator = Orchestrator(settings, repo, manager, metrics, on_session_done=session_done if per_session else None)
     log.info(
         "provider=%s sessions=%s concurrency=%d rps=%.2f storage=%s",
         provider.name,
@@ -105,21 +113,82 @@ async def cmd_scrape(args: argparse.Namespace) -> int:
         "memory" if use_memory else "postgres",
     )
     try:
-        report = await orchestrator.run(codes, refetch=args.refetch, only_failed=args.retry_failed)
+        try:
+            report = await orchestrator.run(codes, refetch=args.refetch, only_failed=args.retry_failed)
+        except asyncio.CancelledError:  # Ctrl+C
+            await _notify_quietly(
+                notifier, run_message(RunStatus.INTERRUPTED, [], metrics.snapshot(), note="Stopped with Ctrl+C.")
+            )
+            raise
+        except Exception as exc:
+            note = f"Crashed: {type(exc).__name__}: {str(exc)[:200]}"
+            await _notify_quietly(notifier, run_message(RunStatus.FAILED, [], metrics.snapshot(), note=note))
+            raise
         if use_memory:
             out = settings.output_dir / ("dry_run.jsonl" if args.dry_run else "memory_run.jsonl")
             count = export_records(await repo.fetch_records(codes), out, "jsonl", include_validation=True)
             print(f"wrote {count} records to {out}")
+        await _notify_quietly(notifier, run_message(report.status, report.sessions, report.metrics))
     finally:
         try:
             await manager.close()
         finally:
-            await repo.close()  # always release the database, even if the browser was already gone
+            try:
+                await repo.close()  # always release the database, even if the browser was already gone
+            finally:
+                await notifier.close()
     _print_report(report)
     return {
         RunStatus.COMPLETED: EXIT_OK,
         RunStatus.BLOCKED: EXIT_BLOCKED,
     }.get(report.status, EXIT_PARTIAL)
+
+
+async def _notify_quietly(notifier: Notifier, text: str) -> None:
+    """Send, but never let a notification delay shutdown for long or replace the real error."""
+    try:
+        await asyncio.wait_for(notifier.send(text), timeout=20)
+    except Exception as exc:  # including TimeoutError
+        log.warning("notification not sent: %s", type(exc).__name__)
+
+
+async def cmd_notify_test(args: argparse.Namespace) -> int:
+    settings = _settings(args)
+    notifier = build_notifier(settings)
+    if not notifier.enabled:
+        print(
+            "error: set CEM_TELEGRAM_BOT_TOKEN and CEM_TELEGRAM_CHAT_ID in .env "
+            "(`cem-scraper telegram-chat-id` finds the chat id)",
+            file=sys.stderr,
+        )
+        return EXIT_ERROR
+    try:
+        sent = await notifier.send("🔔 cem-scraper: test notification. Notifications work.")
+    finally:
+        await notifier.close()
+    print("sent: check Telegram" if sent else "not sent (see the warning above)")
+    return EXIT_OK if sent else EXIT_ERROR
+
+
+async def cmd_telegram_chat_id(args: argparse.Namespace) -> int:
+    settings = _settings(args)
+    notifier = build_notifier(settings, require_chat=False)
+    if not isinstance(notifier, TelegramNotifier):
+        print("error: set CEM_TELEGRAM_BOT_TOKEN in .env first (create a bot with @BotFather)", file=sys.stderr)
+        return EXIT_ERROR
+    try:
+        chats, error = await notifier.chats()
+    finally:
+        await notifier.close()
+    if error:
+        print(f"error: Telegram answered {error}", file=sys.stderr)
+        return EXIT_ERROR
+    if not chats:
+        print("no chats yet: open your bot in Telegram, press Start (or send any message), then run this again")
+        return EXIT_ERROR
+    for chat_id, name in chats:
+        print(f"CEM_TELEGRAM_CHAT_ID={chat_id}    # {name}")
+    return EXIT_OK
 
 
 async def limit_captcha_spending(captcha: CaptchaProvider, settings: Settings, repo: Repository) -> None:
@@ -391,6 +460,8 @@ def build_parser() -> argparse.ArgumentParser:
     parse.add_argument("--number", type=int, required=True)
 
     sub.add_parser("captcha-balance", help="show the CAPTCHA provider balance (free call)")
+    sub.add_parser("notify-test", help="send a test Telegram notification")
+    sub.add_parser("telegram-chat-id", help="show the chat id of whoever wrote to your Telegram bot")
 
     verify = sub.add_parser("verify-sessions", help="check session codes against the official form")
     verify.add_argument("--html", help="saved form_pytania_pes.php page (offline)")
@@ -410,6 +481,8 @@ def main(argv: list[str] | None = None) -> int:
         "validate": cmd_validate,
         "verify-sessions": cmd_verify_sessions,
         "captcha-balance": cmd_captcha_balance,
+        "notify-test": cmd_notify_test,
+        "telegram-chat-id": cmd_telegram_chat_id,
     }
     try:
         if args.command == "parse":

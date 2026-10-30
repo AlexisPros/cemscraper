@@ -14,6 +14,7 @@ _SECRET_PATTERNS = [
     re.compile(r"((?:cookie|set-cookie|authorization)[\"']?\s*[:=]\s*[\"']?)[^\n\"']+", re.IGNORECASE),
     re.compile(r"(postgres(?:ql)?://[^:/\s]+:)[^@\s]+(@)", re.IGNORECASE),
     re.compile(r"([\"']?clientKey[\"']?\s*[:=]\s*[\"']?)[^\"'\s,}]+", re.IGNORECASE),
+    re.compile(r"(\bbot|\b)\d{6,}:[A-Za-z0-9_-]{30,}"),  # Telegram bot token, alone or in an API URL
 ]
 
 
