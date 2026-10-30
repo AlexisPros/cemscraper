@@ -341,9 +341,21 @@ cem-scraper validate                            # re-validate stored records
 cem-scraper parse page.html --session 20031 --number 1   # offline parse
 cem-scraper verify-sessions --html form.html    # check YYYY1/YYYY2 codes against the form
 cem-scraper reparse                                # re-process saved snapshots (CEM_SAVE_HTML_DIR) offline
+cem-scraper check-new                           # collect sessions newer than the ones collected
+cem-scraper check-new --check-only              # only report them
 cem-scraper telegram-chat-id                    # find your chat id for notifications
 cem-scraper notify-test                         # send a test Telegram message
 ```
+
+### New sessions
+
+CEM publishes a session's questions some time after the exam. Run `cem-scraper check-new`
+when you expect a new one. It reads the official form (two requests, no CAPTCHA) and
+collects every session that is newer than the newest configured target (`20262`) and not
+completed in the database, as `cem-scraper scrape --session ...` would: same budget caps,
+same Telegram summary. Older sessions that were never targeted (2014-2025) are ignored. A new
+session that could not be collected (for example, not published yet) is tried again next
+time. `--check-only` reports without collecting. Needs `CEM_ACCEPT_EULA=true` and the database.
 
 ### Telegram notifications
 

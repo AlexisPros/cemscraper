@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import json
 import logging
+import re
 import sys
 from decimal import Decimal
 from pathlib import Path
@@ -21,6 +22,7 @@ from cem_scraper.logging_config import configure_logging
 from cem_scraper.metrics import Metrics
 from cem_scraper.models import (
     AnswerStatistics,
+    CollectionStatus,
     CorrectAnswer,
     ExamSession,
     QuestionData,
@@ -39,6 +41,7 @@ from cem_scraper.session_manager import (
 log = logging.getLogger("cem_scraper")
 
 EXIT_OK, EXIT_ERROR, EXIT_BLOCKED, EXIT_PARTIAL = 0, 1, 2, 3
+SESSION_CODE_RE = re.compile(r"\d{4}[12]")
 
 
 def _settings(args: argparse.Namespace, **extra: Any) -> Settings:
@@ -359,6 +362,66 @@ async def cmd_validate(args: argparse.Namespace) -> int:
     return EXIT_ERROR if invalid else EXIT_OK
 
 
+async def _fetch_entry_form(settings: Settings) -> str:
+    """The official session form: EULA page, then acceptance (two requests, no CAPTCHA)."""
+    from cem_scraper.client import CemClient
+
+    async with CemClient(settings, Metrics()) as client:
+        await client.get(EULA_PATH)
+        return (await client.post(FORM_PATH, {"akceptacja": "tak"})).html
+
+
+def newer_session_codes(offered: dict[str, str], newest_collected: str) -> list[str]:
+    """Session codes in the form that are newer than the newest collected one, oldest first."""
+    codes = [code for code in offered if SESSION_CODE_RE.fullmatch(code)]
+    return sorted((code for code in codes if int(code) > int(newest_collected)), key=int)
+
+
+async def cmd_check_new(args: argparse.Namespace) -> int:
+    """Look for sessions newer than the newest collected one; collect them unless --check-only."""
+    settings = _settings(args)
+    if not settings.accept_eula:
+        print(
+            f"Reading the live form requires accepting the terms at {settings.url(EULA_PATH)}.\n"
+            "Set CEM_ACCEPT_EULA=true after reading them.",
+            file=sys.stderr,
+        )
+        return EXIT_BLOCKED
+    repo = await _postgres(settings)
+    try:
+        summaries = await repo.summaries()
+    finally:
+        await repo.close()
+    completed = {s.session_code for s in summaries if s.collection_status == CollectionStatus.COMPLETED.value}
+    # Only sessions after the newest configured target count, so older sessions that were never
+    # targeted (2014-2025) are not mistaken for new ones. Any of them not completed yet is new,
+    # so a session that failed once (e.g. not published yet) is tried again next time.
+    floor = max(settings.target_sessions, key=int)
+    newest = max([floor, *completed], key=int)
+
+    form = parse_entry_form(await _fetch_entry_form(settings))
+    offered = {code: label for code, label in form.session_options.items() if SESSION_CODE_RE.fullmatch(code)}
+    if not offered:
+        print("error: the form lists no sessions; its layout may have changed", file=sys.stderr)
+        return EXIT_ERROR
+    print(f"newest collected: {newest}; newest in the form: {max(offered, key=int)}")
+    if settings.specialization_code not in form.specialization_options:
+        print(f"warning: specialization {settings.specialization_code} is not among the form's options")
+    new = [code for code in newer_session_codes(offered, floor) if code not in completed]
+    if not new:
+        print("no new sessions")
+        return EXIT_OK
+    for code in new:
+        print(f"  new: {code}  {offered[code]}")
+    if args.check_only:
+        print("not collected (--check-only); run without it, or: cem-scraper scrape --session CODE")
+        return EXIT_OK
+    print(f"collecting {', '.join(new)} into the database")
+    scrape_args = build_parser().parse_args(["scrape", *(arg for code in new for arg in ("--session", code))])
+    scrape_args.log_level = args.log_level
+    return await cmd_scrape(scrape_args)
+
+
 async def cmd_verify_sessions(args: argparse.Namespace) -> int:
     """Check session codes / specialization against the official form's <select> options."""
     settings = _settings(args)
@@ -372,11 +435,7 @@ async def cmd_verify_sessions(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return EXIT_BLOCKED
-        from cem_scraper.client import CemClient
-
-        async with CemClient(settings, Metrics()) as client:
-            await client.get(EULA_PATH)
-            html = (await client.post(FORM_PATH, {"akceptacja": "tak"})).html
+        html = await _fetch_entry_form(settings)
     form = parse_entry_form(html)
     if not form.session_options:
         print("the form has no static <select name=sesja> options (maybe loaded dynamically)")
@@ -461,6 +520,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("captcha-balance", help="show the CAPTCHA provider balance (free call)")
     sub.add_parser("notify-test", help="send a test Telegram notification")
+    check_new = sub.add_parser(
+        "check-new", help="look for sessions newer than the newest collected one and collect them"
+    )
+    check_new.add_argument("--check-only", action="store_true", help="only report new sessions, collect nothing")
     sub.add_parser("telegram-chat-id", help="show the chat id of whoever wrote to your Telegram bot")
 
     verify = sub.add_parser("verify-sessions", help="check session codes against the official form")
@@ -482,6 +545,7 @@ def main(argv: list[str] | None = None) -> int:
         "verify-sessions": cmd_verify_sessions,
         "captcha-balance": cmd_captcha_balance,
         "notify-test": cmd_notify_test,
+        "check-new": cmd_check_new,
         "telegram-chat-id": cmd_telegram_chat_id,
     }
     try:
