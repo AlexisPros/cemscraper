@@ -20,7 +20,7 @@ import pytest
 from pydantic import SecretStr, ValidationError
 
 from cem_scraper.captcha import CaptchaProvider, CaptchaSolution
-from cem_scraper.client import CemClient, LaneFailed, ServerUnavailable
+from cem_scraper.client import CemClient, LaneFailed, RequestFailed, ServerUnavailable
 from cem_scraper.config import Settings
 from cem_scraper.metrics import Metrics
 from cem_scraper.models import ExamSession, RunStatus
@@ -76,6 +76,26 @@ async def test_unreachable_proxy_is_retired_after_three_faults_without_pausing(s
         await client.get("eula_pes.php")
     assert calls.count == 3
     assert client.traffic.concurrency.limit == settings.concurrency  # the proxy's fault: CEM is not slowed down
+
+
+@pytest.mark.parametrize(
+    "error", [httpx.ConnectError("x"), httpx.ConnectTimeout("x"), httpx.ProxyError("502 Bad Gateway")]
+)
+async def test_a_single_attempt_through_a_dead_proxy_fails_the_lane(settings: Settings, error: Exception) -> None:
+    """The CAPTCHA form is submitted exactly once (retries=0). A proxy that dies at that moment
+    used to surface as RequestFailed -> 'session entry failed' -> blocked -> the whole run stopped."""
+    calls = Calls(error)
+    client = proxy_client(settings, calls)
+    with pytest.raises(LaneFailed, match="failed on the last attempt"):
+        await client.post("wyswietl_pytania_pes.php", {"g-recaptcha-response": "token"}, retries=0)
+    assert calls.count == 1  # still exactly one submission
+
+
+async def test_a_single_attempt_failing_at_cem_is_not_blamed_on_the_proxy(settings: Settings) -> None:
+    calls = Calls(httpx.ReadTimeout("CEM did not answer"))
+    client = proxy_client(settings, calls)
+    with pytest.raises(RequestFailed):
+        await client.post("wyswietl_pytania_pes.php", {}, retries=0)
 
 
 async def test_a_proxy_hiccup_does_not_retire_the_lane(settings: Settings) -> None:
@@ -278,3 +298,34 @@ async def test_no_lane_left_blocks_cleanly(settings: Settings) -> None:
     assert report.sessions[0].outcome is SessionOutcome.BLOCKED
     assert "no working lane left" in (report.sessions[0].error or "")
     assert provider.grants == 1  # the second session asked for no entry (and no CAPTCHA)
+
+
+class SubmissionDiesOnProxy(ScriptedProvider):
+    """Like the live run: on the proxy lane, the single CAPTCHA submission hits a dead proxy."""
+
+    def __init__(self, total: int) -> None:
+        super().__init__(default_responder(total), question_limit=total)
+        self.submissions: list[str] = []
+
+    def _handler(self, request: httpx.Request) -> httpx.Response:
+        if b"g-recaptcha-response" in request.content:
+            raise httpx.ConnectError("All connection attempts failed")
+        return super()._handler(request)
+
+    async def acquire(self, session: ExamSession, client: CemClient) -> AccessGrant:
+        if client.traffic.proxied:
+            self.submissions.append(session.session_code)
+            await client.post("wyswietl_pytania_pes.php", {"g-recaptcha-response": "token"}, retries=0)
+        return await super().acquire(session, client)
+
+
+async def test_proxy_dying_at_the_captcha_submission_does_not_stop_the_run(settings: Settings) -> None:
+    provider = SubmissionDiesOnProxy(total=4)
+    orchestrator, _ = build(lanes(settings, pipeline_depth=1), provider)
+    report = await orchestrator.run(["20141", "20142", "20151", "20152"])
+
+    assert report.status is RunStatus.COMPLETED
+    assert [r.outcome for r in report.sessions] == [SessionOutcome.COMPLETED] * 4
+    assert all(r.stored == 4 for r in report.sessions)
+    assert len(provider.submissions) == 1  # the lane was retired after its first failure
+    assert report.metrics["lanes"][PROXY_LANE]["disabled"]

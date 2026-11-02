@@ -172,7 +172,9 @@ class CemClient:
         lane = self.traffic.name
         last_error = "unknown error"
         traffic = self.traffic
+        proxy_fault = False  # the last attempt failed because of the lane's proxy
         for attempt in range(max_retries + 1):
+            proxy_fault = False
             if traffic.disabled:
                 raise LaneFailed(f"lane {lane} is disabled: {traffic.disabled}")
             if traffic.over_byte_cap():
@@ -202,6 +204,7 @@ class CemClient:
                         exc, (httpx.ProxyError, httpx.ConnectError, httpx.ConnectTimeout)
                     ):
                         # The TCP connection goes to the proxy: this is the proxy's fault, not CEM's.
+                        proxy_fault = True
                         if breaker.proxy_fault():
                             raise LaneFailed(
                                 f"proxy of lane {lane} failed {breaker.proxy_fault_limit} times in a row: {last_error}"
@@ -257,6 +260,11 @@ class CemClient:
                 log.info("retrying %s %s in %.1fs", method, path, wait)
                 await self._sleep(wait)
 
+        if proxy_fault:
+            # Out of attempts while the proxy itself failed: blame the lane, not the request or CEM.
+            # This matters most for single-attempt requests (the CAPTCHA form submission): without it
+            # a proxy that dies at that moment would report the session as blocked and stop the run.
+            raise LaneFailed(f"proxy of lane {lane} failed on the last attempt: {last_error}")
         if breaker.failure():
             raise self._lane_or_server(
                 f"lane {lane}: {breaker.consecutive_failures} consecutive requests failed after retries; "
