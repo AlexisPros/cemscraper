@@ -34,10 +34,14 @@ def test_session_codes() -> None:
             ExamSession.from_code(bad)
 
 
-def test_default_targets_are_the_23_required_sessions() -> None:
+def test_default_targets_are_every_session_the_form_offers() -> None:
     targets = default_target_sessions()
-    assert len(targets) == 23
+    assert len(targets) == 38  # what form_pytania_pes.php offers
     assert targets[0] == "20031" and targets[21] == "20132" and targets[-1] == "20262"
+    assert targets[28:31] == ["20171", "20172", "20231"]  # 2018-2022: not in the form
+    assert not [code for code in targets if 2018 <= int(code[:4]) <= 2022]
+    assert "20261" in targets and len(set(targets)) == len(targets)
+    assert targets == sorted(targets, key=int)
 
 
 def test_target_sessions_from_env(monkeypatch: pytest.MonkeyPatch) -> None:

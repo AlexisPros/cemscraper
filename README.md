@@ -2,8 +2,8 @@
 
 A local tool that collects the publicly published PES (Państwowy Egzamin
 Specjalizacyjny) **Psychiatria** questions from CEM
-(`https://www.cem.edu.pl/pytcem/`) for Spring 2003 – Autumn 2013 (22 sessions)
-plus Autumn 2026. Results go into PostgreSQL (JSONB columns), and you can export them to JSON or JSONL.
+(`https://www.cem.edu.pl/pytcem/`) for every session the official form offers: Spring 2003 –
+Autumn 2026, 38 sessions (the form has none from 2018–2022). Results go into PostgreSQL (JSONB columns), and you can export them to JSON or JSONL.
 
 > **Access modes.** Each examination session is entered through CEM's official
 > form, which requires Google reCAPTCHA v2. There are two live modes:
@@ -112,7 +112,7 @@ A token is used once and never stored or logged.
 
 With `CEM_PIPELINE_DEPTH=2`, the next session's CAPTCHA is solved while the current
 session is collected, so its 20–60 s solve time is hidden. Price: 4.49–13.49 PLN per
-1000 reCAPTCHA v2, so a full run (~23 sessions) costs well under 1 PLN.
+1000 reCAPTCHA v2, so a full run (38 sessions) costs well under 1 PLN.
 
 Safety rails, each pinned by a test in `tests/test_money_safety.py`:
 - **The task type matches the page.** The form's reCAPTCHA is identified by the signs in 2Captcha's docs ([v2](https://2captcha.com/api-docs/recaptcha-v2), [v3](https://2captcha.com/api-docs/recaptcha-v3)). The live CEM form is v2 checkbox (`api.js`, `div.g-recaptcha[data-sitekey]`, iframe `size=normal`), solved as `RecaptchaV2TaskProxyless` with only the required fields. Invisible v2, `recaptcha.net` and `data-s` add `isInvisible`, `apiDomain` and `recaptchaDataSValue`. If the site switches to v3 (`api.js?render=…`) or Enterprise (`enterprise.js`), the run stops **before buying anything**. `cem-scraper verify-sessions` shows the detected type.
@@ -215,7 +215,7 @@ After a fail-over during `--refetch`, questions stored before this run are kept,
 fetched again.
 
 Traffic: a question page is ~25 KB of HTML, so one session (120 questions, entry pages)
-is ~3-3.5 MB through its lane, and all 23 sessions ~80 MB. 2Captcha counts incoming plus
+is ~3-3.5 MB through its lane, and all 38 sessions ~130 MB. 2Captcha counts incoming plus
 outgoing traffic; CAPTCHA API calls don't go through the proxy.
 
 Measuring linear growth: run the same number of sessions with 1, 2, 3 ... lanes,
@@ -323,7 +323,7 @@ Live collection, semi-automated. A browser window opens for each session: read a
 cem-scraper scrape --session 20031
 ```
 
-Run all 23 sessions. The run resumes by default, and completed sessions are skipped.
+Run all 38 sessions. The run resumes by default, and completed sessions are skipped.
 
 ```bash
 cem-scraper scrape
@@ -353,7 +353,7 @@ CEM publishes a session's questions some time after the exam. Run `cem-scraper c
 when you expect a new one. It reads the official form (two requests, no CAPTCHA) and
 collects every session that is newer than the newest configured target (`20262`) and not
 completed in the database, as `cem-scraper scrape --session ...` would: same budget caps,
-same Telegram summary. Older sessions that were never targeted (2014-2025) are ignored. A new
+same Telegram summary. Older sessions are left to `cem-scraper scrape`. A new
 session that could not be collected (for example, not published yet) is tried again next
 time. `--check-only` reports without collecting. Needs `CEM_ACCEPT_EULA=true` and the database.
 
@@ -461,17 +461,17 @@ There are 124 tests: parser, models, HTTP client, 2Captcha client, full automati
 
 ## Limitations and open questions
 
-1. **The automated mode has only been tested against mocks.** The CEM side of the HTTP flow (cookies across EULA → form → submission, extra form fields, plain non-JS submission) mirrors the documented browser observations but hasn't been exercised live. If CEM rejects it, the run stops with `blocked` after one CAPTCHA (`reportIncorrect` asks for a refund), and the interactive mode still works. Other solvers (CapSolver, Anti-Captcha) use the same `createTask`/`getTaskResult` protocol and can be added in `captcha.py`.
+1. **The automated mode is verified live** (October 2026): runs through 2Captcha collected 20 sessions with 0 failed requests, one CAPTCHA per session. If CEM ever rejects a token, the run stops with `blocked` after that one CAPTCHA (`reportIncorrect` asks for a refund), and the interactive modes still work. Other solvers (CapSolver, Anti-Captcha) use the same `createTask`/`getTaskResult` protocol and can be added in `captcha.py`.
 2. **Verified on the live site** (interactive run, Spring 2003, 2026-10-28):
    - The entry is `eula_pes.php` → `form_pytania_pes.php` → `wyswietl_pytania_pes.php`. Opening the form directly leads to the *general* form (`eula.php` / `form_pytania.php`, a shorter session list), so the tool always starts at `eula_pes.php` and follows whichever question URL the site uses.
-   - The PES form offers 38 sessions (wiosna 2003 … jesień 2026). All 23 targets and specialization 725 are confirmed (`verify-sessions`).
+   - The PES form offers 38 sessions (wiosna 2003 … jesień 2026). The 38 default targets are exactly the offered sessions; there are none from 2018–2022. Specialization 725 is confirmed (`verify-sessions`).
    - The header `Pytanie nr N - PES Psychiatria w sesji wiosna 2003` verifies both the question number and the session.
    - Numbers past the end (121+) return the EULA page. The form lists 1…120, so in `http_form` / `interactive_browser` they are never requested. In `manual_chrome` they are recognized as missing by re-checking a known question.
    - Annulled questions show answer `X` and `-` statistics. They are stored as `needs_review` instead of failing.
    - The session cookie works outside the browser. Question pages take a steady ~11 s; the adaptive limit rose to 4, giving about 6 minutes per 120-question session.
    - Saved snapshots can be reprocessed offline after a parser fix with `cem-scraper reparse`.
 3. **Throttling.** The roughly 9–11 s responses seen in DevTools are unexplained. The tool doesn't try to get around them. It runs at low concurrency and stops when the server asks it to back off.
-4. Each session needs its own CAPTCHA, and re-entering an expired session costs another one. Expect about 23 manual solves for a full run.
+4. Each session needs its own CAPTCHA, and re-entering an expired session costs another one. A full run takes 38 solves: by hand in the browser modes, or 38 paid 2Captcha tasks (~0.11 USD).
 
 ## Responsible use
 

@@ -1,7 +1,7 @@
 [project]
 name = "cem-scraper"
 version = "0.1.0"
-description = "Collector for publicly published CEM PES Psychiatry examination questions (Spring 2003 - Autumn 2013, Autumn 2026)."
+description = "Collector for publicly published CEM PES Psychiatry examination questions (Spring 2003 - Autumn 2026)."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [

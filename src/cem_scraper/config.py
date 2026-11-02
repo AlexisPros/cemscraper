@@ -24,11 +24,15 @@ SPECIALIZATION_NAME = "Psychiatria"
 PSYCHIATRY_SPECIALIZATION_CODE = "725"
 
 
+# The official form offers no sessions from these years (checked against form_pytania_pes.php,
+# October 2026). A code the form doesn't offer stops the run before any CAPTCHA is bought.
+YEARS_NOT_IN_FORM = range(2018, 2023)
+
+
 def default_target_sessions() -> list[str]:
-    """Spring 2003 .. Autumn 2013 (22 sessions) plus Autumn 2026."""
-    codes = [f"{year}{half}" for year in range(2003, 2014) for half in (1, 2)]
-    codes.append("20262")
-    return codes
+    """Every PES session the official form offers: Spring 2003 .. Autumn 2026, without 2018-2022 (38)."""
+    years = [year for year in range(2003, 2027) if year not in YEARS_NOT_IN_FORM]
+    return [f"{year}{half}" for year in years for half in (1, 2)]
 
 
 class AccessProviderName(StrEnum):

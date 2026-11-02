@@ -97,8 +97,8 @@ async def test_nothing_new_means_nothing_collected(
     assert h.scraped == [] and "no new sessions" in capsys.readouterr().out
 
 
-async def test_older_untargeted_sessions_are_never_new(env: None, monkeypatch: pytest.MonkeyPatch) -> None:
-    """2014-2025 are in the form but were never targeted: the newest *target* (20262) is the baseline."""
+async def test_sessions_older_than_the_newest_target_are_never_new(env: None, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Older sessions are for `scrape`, not `check-new`: the newest *target* (20262) is the baseline."""
     h = Harness(monkeypatch, form_with('<option value="20141">Wiosna 2014</option><option value="20252">x</option>'))
     assert await h.run() == cli.EXIT_OK  # empty database
     assert h.scraped == []

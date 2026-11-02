@@ -404,9 +404,9 @@ async def cmd_check_new(args: argparse.Namespace) -> int:
         )
         return EXIT_ERROR
     completed = {s.session_code for s in summaries if s.collection_status == CollectionStatus.COMPLETED.value}
-    # Only sessions after the newest configured target count, so older sessions that were never
-    # targeted (2014-2025) are not mistaken for new ones. Any of them not completed yet is new,
-    # so a session that failed once (e.g. not published yet) is tried again next time.
+    # Only sessions after the newest configured target count: older ones are either targets
+    # already (`scrape` collects them) or deliberately left out. Any newer one not completed yet
+    # is new, so a session that failed once (e.g. not published yet) is tried again next time.
     floor = max(settings.target_sessions, key=int)
     newest = max([floor, *completed], key=int)
 
